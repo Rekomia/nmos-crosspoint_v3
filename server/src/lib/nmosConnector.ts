@@ -76,6 +76,9 @@ export class NmosRegistryConnector {
 
         this.registryVersionList = this.settings.nmos.registryVersions;
         this.connectVersionList = this.settings.nmos.connectVersions
+        this.queryDowngradeVersion = (typeof this.settings.nmos.queryDowngrade === "string")
+            ? this.settings.nmos.queryDowngrade
+            : "";
 
         // TODO dev cleanup
         //if(loaddev){
@@ -328,6 +331,21 @@ export class NmosRegistryConnector {
     private registryVersionList = ["v1.3","v1.2"];
     private connectVersionList = ["v1.1", "v1.0"];
     private channelmappingVersionList = ["v1.0"];
+
+    // ----- IS-04 downgrade queries -----
+    // The Query API only ever hands out resources that were registered
+    // against the very version being queried: subscribe to v1.3 and every
+    // device that registered at v1.2 is simply absent — it shows up nowhere
+    // in the crosspoint and cannot be routed. `query.downgrade=<version>`
+    // asks the registry to include those older resources as well, each in
+    // its own (older) representation. The value is the OLDEST version we
+    // still want; "" switches the parameter off.
+    private queryDowngradeVersion:string = "";
+    // "<registryUrl>_<version>" for every registry that answered the
+    // subscription POST with an error status while query.downgrade was set.
+    // Downgrade queries are an optional IS-04 feature, so we remember the
+    // refusal and subscribe without the parameter instead of looping.
+    private downgradeUnsupported:Set<string> = new Set<string>();
     private nmosRegistryList: NmosRegistry[] = [];
 
     // Generation counter for live registry switching. Every WebSocket
@@ -409,6 +427,95 @@ export class NmosRegistryConnector {
         this.getVersionSubscription(nmosRegistryUrl, resource, 0);
     }
 
+    /**
+     * A resource's `controls` list (IS-05 / IS-08 endpoints of a device).
+     * `controls` only exists from IS-04 v1.1 onwards, so a device registered
+     * against v1.0 — which a downgrade query can now surface — carries none
+     * at all. Returning an empty list keeps every caller on its existing
+     * "no control endpoint" path instead of throwing on `undefined.forEach`.
+     */
+    private static controlsOf(resource:any):any[]{
+        return (resource && Array.isArray(resource.controls)) ? resource.controls : [];
+    }
+
+    /**
+     * The name/MAC pairs for the interfaces a sender or receiver is bound to.
+     * Both `interface_bindings` (sender/receiver) and `interfaces` (node)
+     * arrived with IS-04 v1.2, so a resource from an older API version — which
+     * a downgrade query can surface — simply yields an empty list instead of
+     * throwing on `undefined.forEach`.
+     */
+    private static bindingInterfaces(resource:any, node:any):Array<{name:any, mac:any}>{
+        const out:Array<{name:any, mac:any}> = [];
+        const bindings       = (resource && Array.isArray(resource.interface_bindings)) ? resource.interface_bindings : [];
+        const nodeInterfaces = (node     && Array.isArray(node.interfaces))             ? node.interfaces             : [];
+        bindings.forEach((name:any)=>{
+            nodeInterfaces.forEach((inter:any)=>{
+                if(inter.name == name){
+                    out.push({name:name, mac:inter.port_id});
+                }
+            });
+        });
+        return out;
+    }
+
+    /**
+     * How many ST 2022-7 legs a sender or receiver has. Counted from
+     * `interface_bindings`, which is an IS-04 v1.2 field: a pre-v1.2 resource
+     * has none and could not have expressed more than one leg anyway, so one
+     * is the right answer for it (and for the spec-violating empty array).
+     */
+    private static legCountOf(resource:any):number{
+        return (resource && Array.isArray(resource.interface_bindings) && resource.interface_bindings.length > 0)
+            ? resource.interface_bindings.length
+            : 1;
+    }
+
+    /** Rank of an "vX.Y" API version string, -1 when it doesn't parse. */
+    private static versionRank(version:string):number{
+        let m = /^v(\d+)\.(\d+)$/.exec("" + version);
+        if(!m) return -1;
+        return (parseInt(m[1], 10) * 1000) + parseInt(m[2], 10);
+    }
+
+    /**
+     * The value to send as `query.downgrade` when subscribing to `version` on
+     * this registry — or "" when the parameter must not be sent at all:
+     * downgrade switched off, this registry already refused it, or the target
+     * is not actually OLDER than the version we subscribe to (a downgrade to
+     * the queried version or newer is meaningless and gets rejected).
+     */
+    private downgradeParamFor(registryUrl:string, version:string):string{
+        const target = this.queryDowngradeVersion;
+        if(!target) return "";
+        if(this.downgradeUnsupported.has(registryUrl + "_" + version)) return "";
+        const targetRank  = NmosRegistryConnector.versionRank(target);
+        const versionRank = NmosRegistryConnector.versionRank(version);
+        if(targetRank < 0 || versionRank < 0) return "";
+        if(targetRank >= versionRank) return "";
+        return target;
+    }
+
+    /**
+     * Live-apply a change of the downgrade setting (Setup page). The
+     * parameter is fixed when a subscription is created, so the caller has to
+     * re-subscribe afterwards — returns true when the value actually changed.
+     */
+    public setQueryDowngrade(version:string):boolean{
+        const next = (typeof version === "string") ? version : "";
+        if(next === this.queryDowngradeVersion) return false;
+        this.queryDowngradeVersion = next;
+        try{
+            if(this.settings && this.settings.nmos){ this.settings.nmos.queryDowngrade = next; }
+        }catch(e){}
+        // A registry that refused the old value may well accept the new one.
+        this.downgradeUnsupported.clear();
+        SyncLog.log("info", "NMOS Settings", next
+            ? "Query API downgrade set to " + next + " — devices registered from " + next + " upwards will be used."
+            : "Query API downgrade switched off — only devices registered against the subscribed API version will be used.");
+        return true;
+    }
+
     private getVersionSubscription(nmosRegistryUrl: string, resource: string, versionIndex:number){
         const version = this.registryVersionList[versionIndex];
         if(!version) return;
@@ -416,9 +523,14 @@ export class NmosRegistryConnector {
         // is called mid-flight (live switch), this.registryGen advances and the
         // late-arriving response / reconnect timer skips itself.
         const myGen = this.registryGen;
+        // Downgrade query — see queryDowngradeVersion. Empty means the
+        // parameter is left out entirely, which is exactly the old behaviour.
+        const downgrade = this.downgradeParamFor(nmosRegistryUrl, version);
+        const params:any = {};
+        if(downgrade){ params["query.downgrade"] = downgrade; }
         axios.post(nmosRegistryUrl + "/x-nmos/query/" + version + "/subscriptions", {
             resource_path: resource,
-            params: {},
+            params,
             persist: false,
             max_update_rate_ms: 50,
         }).then((response: any) => {
@@ -447,6 +559,7 @@ export class NmosRegistryConnector {
             let newWs:any = new WebSocket(subscription.ws_href);
             this.connections[fullResource] = {
                 version,
+                downgrade,
                 subscription,
                 ws: newWs,
                 pingInterval: null,
@@ -529,9 +642,30 @@ export class NmosRegistryConnector {
                 this.updateState(parsed,version,nmosRegistryUrl);
             };
 
-            SyncLog.log("info",  "NMOS","Subscribed to Registry: " + nmosRegistryUrl + ", " + resource + ", " + version );
+            SyncLog.log("info",  "NMOS","Subscribed to Registry: " + nmosRegistryUrl + ", " + resource + ", " + version +
+                (downgrade ? " (downgrade to " + downgrade + ")" : "") );
         }).catch((error) => {
             if(myGen !== this.registryGen) return;  // Switched registries while the POST was failing.
+            // Downgrade queries are OPTIONAL in IS-04. A registry that does
+            // not implement them answers the POST with 501 (unsupported query
+            // syntax) or 400 / 422 (bad parameter) — note it down and retry
+            // the SAME version without the parameter right away, so the
+            // subscription still comes up. Every other status is about the
+            // request as a whole, NOT about our parameter: a 404 in
+            // particular just means the registry doesn't serve this Query API
+            // version, which is what the version cascade below is for.
+            const paramRefused = [400, 422, 501].includes(error?.response?.status);
+            if(downgrade && paramRefused){
+                const key = nmosRegistryUrl + "_" + version;
+                if(!this.downgradeUnsupported.has(key)){
+                    this.downgradeUnsupported.add(key);
+                    SyncLog.log("warning", "NMOS", "Registry " + nmosRegistryUrl + " rejected query.downgrade=" + downgrade +
+                        " on Query API " + version + " (HTTP " + error.response.status + "). Subscribing without it — devices " +
+                        "registered against an older API version will not show up.");
+                }
+                this.getVersionSubscription(nmosRegistryUrl, resource, versionIndex);
+                return;
+            }
             if(versionIndex + 1 < this.registryVersionList.length){
                 // The registry may simply not offer this Query API version —
                 // fall through to the next one right away.
@@ -573,6 +707,9 @@ export class NmosRegistryConnector {
         }
         this.connections = {};
         this.nmosRegistryList = [];
+        // The next registry is a different implementation as far as we know —
+        // probe its downgrade support again instead of carrying over a "no".
+        this.downgradeUnsupported.clear();
         // Reset the in-memory NMOS state so the UI doesn't see stale devices
         // from the previous registry. setState emits a JSON-patch reset to
         // every subscribed client.
@@ -866,7 +1003,7 @@ export class NmosRegistryConnector {
 
     async loadChannelMaping(postData:any){
         let cmLoaded = false;
-        for(let c of postData.controls){
+        for(let c of NmosRegistryConnector.controlsOf(postData)){
             // TODO: other versions
             if(c.type=="urn:x-nmos:control:cm-ctrl/v1.0"){
                 try{
@@ -1086,7 +1223,7 @@ export class NmosRegistryConnector {
                         // (which may exist for compatibility but lack fields).
                         let preferred = ["urn:x-nmos:control:sr-ctrl/v1.1", "urn:x-nmos:control:sr-ctrl/v1.0"];
                         for(let ctrlType of preferred){
-                            device.controls.forEach((c:any)=>{
+                            NmosRegistryConnector.controlsOf(device).forEach((c:any)=>{
                                 if(c.type === ctrlType){
                                     let href = c.href;
                                     if(href[href.length-1] !== "/"){
@@ -1165,10 +1302,14 @@ export class NmosRegistryConnector {
                 endpoints.forEach((e) => {
                     Object.keys(this.connections).forEach((c)=>{
                         if(c.startsWith(url + "_/" + e )){
+                            // `downgrade` is what the subscription was actually
+                            // created with — "" when the registry refused the
+                            // parameter, which is what the Setup page shows.
+                            const downgrade = this.connections[c].downgrade || "";
                             if (this.connections[c].ws.readyState == WebSocket.OPEN) {
-                                entry.connected.push({endpoint:e, version:this.connections[c].version, connected:true});
+                                entry.connected.push({endpoint:e, version:this.connections[c].version, downgrade, connected:true});
                             }else{
-                                entry.connected.push({endpoint:e, version:this.connections[c].version, connected:false});
+                                entry.connected.push({endpoint:e, version:this.connections[c].version, downgrade, connected:false});
                             }
                         }
                     })
@@ -1184,7 +1325,10 @@ export class NmosRegistryConnector {
         }catch(e){}
         const next = {
             registries: list,
-            dnssd: { enabled: dnssdEnabled, override: dnssdOverride, domains: this.lastDnssdDomains }
+            dnssd: { enabled: dnssdEnabled, override: dnssdOverride, domains: this.lastDnssdDomains },
+            // What the operator asked for. Each subscription above reports
+            // what it actually got, which differs when a registry refused it.
+            queryDowngrade: this.queryDowngradeVersion
         };
 
         // Publish only on an actual change. This used to re-arm itself every
@@ -1514,13 +1658,7 @@ export class NmosRegistryConnector {
             }
         //}
 
-        sender.interface_bindings.forEach((name:any)=>{
-            node.interfaces.forEach((inter:any)=>{
-                if(inter.name == name){
-                    info.interfaces.push({name:name,mac:inter.port_id});
-                }
-            })
-        });
+        info.interfaces = NmosRegistryConnector.bindingInterfaces(sender, node);
 
         if(sender.transport == "urn:x-nmos:transport:rtp.mcast"){
             info.transport = "rtp.mcast"
@@ -1529,7 +1667,9 @@ export class NmosRegistryConnector {
             info.transport = "rtp"
         } 
 
-        info.active = sender.subscription.active;
+        // `subscription` on a Sender only exists from IS-04 v1.2 on — a
+        // sender from an older API version reports no activity state.
+        info.active = !!(sender.subscription && sender.subscription.active);
 
         return info
     }
@@ -1581,14 +1721,7 @@ export class NmosRegistryConnector {
             throw new Error("NMOS: Receiver not available. (Offline?)");
         }
 
-        let interfaces = [];
-        receiver.interface_bindings.forEach((name:any)=>{
-            node.interfaces.forEach((inter:any)=>{
-                if(inter.name == name){
-                    interfaces.push({name:name,mac:inter.port_id});
-                }
-            })
-        });
+        let interfaces = NmosRegistryConnector.bindingInterfaces(receiver, node);
 
         // Parse the SDP so we can build EXPLICIT transport_params per leg
         // (multicast_ip / destination_port / source_ip). Some receivers
@@ -1622,7 +1755,7 @@ export class NmosRegistryConnector {
             }
         }
 
-        let receiverLegCount = receiver.interface_bindings.length;
+        let receiverLegCount = NmosRegistryConnector.legCountOf(receiver);
         for(let i = 0; i < receiverLegCount; i++){
             if(senderInfo.senderId == "disconnect"){
                 patch.transport_params.push({ rtp_enabled: false });
@@ -1695,7 +1828,7 @@ export class NmosRegistryConnector {
         let controlTypes = [{type:"urn:x-nmos:control:sr-ctrl/v1.1",version:"v1.1"}, {type:"urn:x-nmos:control:sr-ctrl/v1.0",version:"v1.0"}]
 
         for(let type of controlTypes){
-            device.controls.forEach((control)=>{
+            NmosRegistryConnector.controlsOf(device).forEach((control)=>{
                 if(control.type == type.type){
                     controlHrefs.push({href:control.href, version:type.version});
                     versionFound = true;
@@ -1763,7 +1896,7 @@ export class NmosRegistryConnector {
             let controlTypes = [{type:"urn:x-nmos:control:sr-ctrl/v1.1",version:"v1.1"}, {type:"urn:x-nmos:control:sr-ctrl/v1.0",version:"v1.0"}]
 
             for(let type of controlTypes){
-                device.controls.forEach((control)=>{
+                NmosRegistryConnector.controlsOf(device).forEach((control)=>{
                     if(control.type == type.type){
                         controlHrefs.push({href:control.href, version:type.version});
                         versionFound = true;
@@ -1868,7 +2001,7 @@ export class NmosRegistryConnector {
                 {type:"urn:x-nmos:control:sr-ctrl/v1.0", version:"v1.0"}
             ];
             for(let type of controlTypes){
-                device.controls.forEach((control:any)=>{
+                NmosRegistryConnector.controlsOf(device).forEach((control:any)=>{
                     if(control.type == type.type){
                         controlHrefs.push({href:control.href, version:type.version});
                         versionFound = true;
@@ -1959,7 +2092,7 @@ export class NmosRegistryConnector {
             let controlTypes = [{type:"urn:x-nmos:control:sr-ctrl/v1.1",version:"v1.1"}, {type:"urn:x-nmos:control:sr-ctrl/v1.0",version:"v1.0"}]
 
             for(let type of controlTypes){
-                device.controls.forEach((control)=>{
+                NmosRegistryConnector.controlsOf(device).forEach((control)=>{
                     if(control.type == type.type){
                         controlHrefs.push({href:control.href, version:type.version});
                         versionFound = true;
