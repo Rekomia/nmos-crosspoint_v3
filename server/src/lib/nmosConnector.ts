@@ -471,6 +471,49 @@ export class NmosRegistryConnector {
             : 1;
     }
 
+    /**
+     * How many legs to address in an IS-05 PATCH.
+     *
+     * The device is the authority: its /active endpoint carries exactly one
+     * transport_params entry per leg, and IS-05 requires a PATCH to carry the
+     * same number — a shorter array is rejected outright ("Invalid
+     * parameter"). IS-04's interface_bindings only counts the interfaces the
+     * device actually BOUND, so a device that exposes a second leg over IS-05
+     * without binding it (interface_ip 0.0.0.0) reports one there and two
+     * here. The active snapshot therefore wins; interface_bindings is the
+     * fallback for when we could not read one.
+     */
+    private static legCountFromActive(active:any, resource:any):number{
+        try{
+            if(active && Array.isArray(active.transport_params) && active.transport_params.length > 0){
+                return active.transport_params.length;
+            }
+        }catch(e){}
+        return NmosRegistryConnector.legCountOf(resource);
+    }
+
+    /**
+     * A receiver's IS-05 active parameters, read straight from the device.
+     * The registry does not carry them, and they are the only reliable
+     * statement of how many legs a PATCH has to address. Returns null when no
+     * control endpoint answers — the caller then falls back to IS-04.
+     */
+    private async getReceiverActive(receiverId:string, controlHrefs:{href:string}[]):Promise<any|null>{
+        for(const control of controlHrefs){
+            let href = control.href;
+            if(href[href.length-1] !== "/"){ href += "/"; }
+            href += "single/receivers/" + receiverId + "/active";
+            try{
+                const response = await axios.get(href, {timeout:5000});
+                if(response && response.data){ return response.data; }
+            }catch(e){
+                // Unreachable or wrong endpoint — the caller hands us every
+                // control href the device advertises, so try the next one.
+            }
+        }
+        return null;
+    }
+
     /** Rank of an "vX.Y" API version string, -1 when it doesn't parse. */
     private static versionRank(version:string):number{
         let m = /^v(\d+)\.(\d+)$/.exec("" + version);
@@ -1755,7 +1798,37 @@ export class NmosRegistryConnector {
             }
         }
 
-        let receiverLegCount = NmosRegistryConnector.legCountOf(receiver);
+        // The IS-05 control endpoints of the receiver's device. Resolved here
+        // rather than just before the PATCH because the number of legs has to
+        // be read from the device before transport_params can be built.
+        let versionFound = false;
+        let controlHrefs = [];
+        let controlTypes = [{type:"urn:x-nmos:control:sr-ctrl/v1.1",version:"v1.1"}, {type:"urn:x-nmos:control:sr-ctrl/v1.0",version:"v1.0"}]
+
+        for(let type of controlTypes){
+            NmosRegistryConnector.controlsOf(device).forEach((control)=>{
+                if(control.type == type.type){
+                    controlHrefs.push({href:control.href, version:type.version});
+                    versionFound = true;
+                }
+            })
+            if(versionFound){
+                break;
+            }
+        }
+
+        // transport_params is positional and its length is part of the
+        // contract: IS-05 rejects a PATCH that addresses fewer legs than the
+        // receiver has. Ask the device, don't count IS-04 interface_bindings
+        // — a device may expose a leg it never bound to an interface, and
+        // then the two disagree and every take fails with "Invalid
+        // parameter".
+        let receiverActive = await this.getReceiverActive(receiverId, controlHrefs);
+        let receiverLegCount = NmosRegistryConnector.legCountFromActive(receiverActive, receiver);
+        if(!receiverActive){
+            SyncLog.log("warning", "NMOS Connect", "Could not read the IS-05 active parameters of receiver " + receiverId +
+                " — addressing " + receiverLegCount + " leg(s) from its IS-04 interface_bindings instead.");
+        }
         for(let i = 0; i < receiverLegCount; i++){
             if(senderInfo.senderId == "disconnect"){
                 patch.transport_params.push({ rtp_enabled: false });
@@ -1822,22 +1895,6 @@ export class NmosRegistryConnector {
             //    patch.master_enable = true;
             //}
         //}
-
-        let versionFound = false;
-        let controlHrefs = [];
-        let controlTypes = [{type:"urn:x-nmos:control:sr-ctrl/v1.1",version:"v1.1"}, {type:"urn:x-nmos:control:sr-ctrl/v1.0",version:"v1.0"}]
-
-        for(let type of controlTypes){
-            NmosRegistryConnector.controlsOf(device).forEach((control)=>{
-                if(control.type == type.type){
-                    controlHrefs.push({href:control.href, version:type.version});
-                    versionFound = true;
-                }
-            })
-            if(versionFound){
-                break;
-            }
-        }
 
         let done = false;
 
@@ -1907,19 +1964,15 @@ export class NmosRegistryConnector {
                 }
             }
 
-            // Determine number of legs: prefer interface_bindings, otherwise
-            // fall back to whatever the sender currently advertises in its
-            // active transport_params; default to 1 leg.
+            // How many legs a PATCH has to address.
             let legCount = 1;
             try{
-                if(Array.isArray(sender.interface_bindings) && sender.interface_bindings.length > 0){
-                    legCount = sender.interface_bindings.length;
-                }else{
-                    let activeData = (this.nmosState as any).senderActiveData?.[senderId];
-                    if(activeData && Array.isArray(activeData.transport_params) && activeData.transport_params.length > 0){
-                        legCount = activeData.transport_params.length;
-                    }
-                }
+                // The cached IS-05 active snapshot decides, exactly as on the
+                // receiver side — interface_bindings only counts the
+                // interfaces the device bound and can report fewer legs than
+                // the device actually exposes.
+                let activeData = (this.nmosState as any).senderActiveData?.[senderId];
+                legCount = NmosRegistryConnector.legCountFromActive(activeData, sender);
             }catch(e){}
             if(legCount < 1){ legCount = 1; }
 
@@ -2106,14 +2159,12 @@ export class NmosRegistryConnector {
             // Determine number of legs the sender actually advertises.
             let legCount = 1;
             try{
-                if(Array.isArray(sender.interface_bindings) && sender.interface_bindings.length > 0){
-                    legCount = sender.interface_bindings.length;
-                }else{
-                    let activeData = (this.nmosState as any).senderActiveData?.[senderId];
-                    if(activeData && Array.isArray(activeData.transport_params) && activeData.transport_params.length > 0){
-                        legCount = activeData.transport_params.length;
-                    }
-                }
+                // The cached IS-05 active snapshot decides, exactly as on the
+                // receiver side — interface_bindings only counts the
+                // interfaces the device bound and can report fewer legs than
+                // the device actually exposes.
+                let activeData = (this.nmosState as any).senderActiveData?.[senderId];
+                legCount = NmosRegistryConnector.legCountFromActive(activeData, sender);
             }catch(e){}
             if(legCount < 1){ legCount = 1; }
 
