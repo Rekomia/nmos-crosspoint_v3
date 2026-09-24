@@ -346,6 +346,23 @@ export class NmosRegistryConnector {
     // Downgrade queries are an optional IS-04 feature, so we remember the
     // refusal and subscribe without the parameter instead of looping.
     private downgradeUnsupported:Set<string> = new Set<string>();
+
+    // ----- Receivers that refuse a transport file -----
+    // IS-05 lets a controller hand a receiver the sender's SDP so it learns
+    // the media format. Not every device accepts one: a Riedel FusioN answers
+    // 400 "Invalid parameter" to ANY transport_file on its v1.0 endpoint —
+    // its own SDP, read from /active and sent straight back, included.
+    //
+    // Keyed by the IS-05 endpoint that refused it, not by the device: one
+    // node can publish a whole row of devices behind a single connection API,
+    // and they all behave the same. Keying by device made every one of them
+    // burn its own failed PATCH before learning the same lesson.
+    private transportFileUnsupported:Set<string> = new Set<string>();
+
+    /** True when any of these control endpoints has already refused one. */
+    private refusesTransportFile(controlHrefs:{href:string}[]):boolean{
+        return controlHrefs.some((c) => this.transportFileUnsupported.has(c.href));
+    }
     private nmosRegistryList: NmosRegistry[] = [];
 
     // Generation counter for live registry switching. Every WebSocket
@@ -1868,10 +1885,14 @@ export class NmosRegistryConnector {
                 manifest = manifest.replace("TCS=UNSPECIFIED;", "TCS=SDR;");
             }
 
-            patch.transport_file = {
-                type: "application/sdp",
-                data: manifest,
-            };
+            // An empty manifest is not a transport file, it is a PATCH the
+            // device has every right to reject.
+            if(manifest && !this.refusesTransportFile(controlHrefs)){
+                patch.transport_file = {
+                    type: "application/sdp",
+                    data: manifest,
+                };
+            }
         }
 
         if(senderInfo.senderId == "disconnect"){
@@ -1921,6 +1942,36 @@ export class NmosRegistryConnector {
                         // NEXT
                         let id = SyncLog.log("info", "nmos_connect", "Patch on "+patchHref+" timed out, trying next.");
                     }else{
+                        // A receiver that will not take a transport file at all
+                        // rejects the whole PATCH over it. Everything the join
+                        // needs — multicast address, port, SSM source, per leg —
+                        // already rides in transport_params, so try again
+                        // without the file before giving up. Only a success
+                        // proves the file was the problem; anything else falls
+                        // through to the original rejection below.
+                        if(e.response?.status === 400 && patch.transport_file){
+                            let retry:any = { ...patch };
+                            delete retry.transport_file;
+                            try{
+                                let result = await axios.patch(patchHref, retry, {timeout:30000});
+                                this.transportFileUnsupported.add(href.href);
+                                SyncLog.log("warning", "nmos_connect", "Receiver " + receiverId + " refuses a transport file on its IS-05 " +
+                                    href.version + " endpoint — patched without it. The stream parameters are carried by transport_params; " +
+                                    "the device has to know the media format by itself. Every receiver behind " + href.href +
+                                    " now leaves the file out from the start.");
+                                return SyncLog.log("success", "nmos_connect", "Successfully patched: "+receiverId, {href:patchHref, data:retry, status:result?.status, response:result?.data});
+                            }catch(e2:any){
+                                // Not the transport file then. Say so with the
+                                // device's answer — without this line the retry
+                                // is invisible and the log looks as if it never
+                                // happened, which is exactly the wrong hint
+                                // when the real cause is somewhere else.
+                                SyncLog.log("warning", "nmos_connect", "Receiver " + receiverId +
+                                    " rejected the PATCH without the transport file as well — the file is not the problem here.",
+                                    { href: patchHref, data: retry, status: e2?.response?.status, error: e2?.response?.data,
+                                      message: e2?.message });
+                            }
+                        }
                         // TODO....
                         if(e.code == "ERR_BAD_REQUEST"){
                             let id = SyncLog.log("error", "nmos_connect", "Receiver "+receiverId+" returned Error: "+e.code,{controlHrefs,failedControl:patchHref,patch, status:e.response?.status, error:e.response?.data,});
