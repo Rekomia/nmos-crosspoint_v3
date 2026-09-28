@@ -133,7 +133,9 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         return new Promise((resolve, reject) => {
             if(id.startsWith("nmos_")){
                 let nmosId = id.slice(5);
-                NmosRegistryConnector.instance.enableFlow(nmosId,disable);
+                // The device's refusal is already in the log; the UI does
+                // not wait for the answer.
+                NmosRegistryConnector.instance.enableFlow(nmosId,disable).catch(()=>{});
             }
             resolve({});
         });
@@ -830,7 +832,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                         senderInfo.active = true;
                     }catch(e:any){
                         let msg = "Could not auto-activate sender: " + (e && e.message ? e.message : "unknown");
-                        reject({src:src,dst:dst,status:"failed", detail:{message: msg, log:""}});
+                        reject({src:src,dst:dst,status:"failed", detail:{message: msg, log:(e instanceof LoggedError) ? e.logId : ""}});
                         return;
                     }
                 }
@@ -1929,7 +1931,10 @@ export interface CrosspointConnectionSenderInfo {
     interfaces:any[],
     active:boolean,
     error:string,
-    transport:string
+    transport:string,
+    /** The sender's IS-05 /active, read fresh at connect time — what the
+     *  device says it transmits, as opposed to what its SDP says. */
+    senderActive?:any
 }
 
 export interface CrosspointShadowDevice {

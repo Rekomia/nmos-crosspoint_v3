@@ -5,6 +5,7 @@
 
 import * as WebSocket from "ws";
 import * as dns from "dns";
+import * as net from "net";
 import axios from "axios";
 import { SyncObject } from "./SyncServer/syncObject";
 import { Subject } from "rxjs";
@@ -507,6 +508,43 @@ export class NmosRegistryConnector {
             }
         }catch(e){}
         return NmosRegistryConnector.legCountOf(resource);
+    }
+
+    /** A multicast group address (224.0.0.0/4 or ff00::/8). */
+    private static isMulticast(ip:any):boolean{
+        if(typeof ip !== "string") return false;
+        if(net.isIPv4(ip)) return (parseInt(ip.split(".")[0], 10) & 0xf0) === 0xe0;
+        if(net.isIPv6(ip)) return ip.toLowerCase().startsWith("ff");
+        return false;
+    }
+
+    /** An address a packet can come from: an IP, not "auto", not the
+     *  unspecified address, not a group. */
+    private static isUnicastHost(ip:any):boolean{
+        if(typeof ip !== "string" || net.isIP(ip) === 0) return false;
+        if(ip === "0.0.0.0" || ip === "::") return false;
+        return !NmosRegistryConnector.isMulticast(ip);
+    }
+
+    /**
+     * Replace the source address in the `a=source-filter` lines of the given
+     * media sections (0-based `m=` index). Section-wise because both legs of
+     * a 2022-7 pair may use the same group and only differ in source.
+     */
+    private static replaceSdpSources(sdp:string, fixes:Array<{ leg:number, sdp:string, active:string }>):string{
+        let lines = sdp.split(/(\r?\n)/);   // keeps the line endings
+        let media = -1;
+        for(let i = 0; i < lines.length; i += 2){
+            if(lines[i].startsWith("m=")){ media++; continue; }
+            if(media < 0 || !lines[i].startsWith("a=source-filter:")){ continue; }
+            let fix = fixes.find((f) => f.leg === media);
+            if(!fix){ continue; }
+            // a=source-filter: incl IN IP4 <group> <source> [<source> ...]
+            // Only the tokens after the group are sources.
+            lines[i] = lines[i].replace(/^(a=source-filter:\s*\S+\s+\S+\s+\S+\s+\S+)(.*)$/, (_m, head:string, rest:string) =>
+                head + rest.split(/(\s+)/).map((t) => t === fix.sdp ? fix.active : t).join(""));
+        }
+        return lines.join("");
     }
 
     /**
@@ -1634,8 +1672,11 @@ export class NmosRegistryConnector {
             }
             // Build the list of multicasts we want to claim, per leg index.
             let ourLegs: Array<{ index:number, ip:string }> = [];
+            // Only real groups can collide. A disabled sender may report
+            // "auto", 0.0.0.0 or a unicast default here — every output of a
+            // card the same one — and that is no reason to refuse it.
             activeData.transport_params.forEach((tp:any, index:number)=>{
-                if(tp && typeof tp.destination_ip === "string" && tp.destination_ip){
+                if(tp && NmosRegistryConnector.isMulticast(tp.destination_ip)){
                     ourLegs.push({ index, ip: tp.destination_ip });
                 }
             });
@@ -1719,6 +1760,13 @@ export class NmosRegistryConnector {
         //}
 
         info.interfaces = NmosRegistryConnector.bindingInterfaces(sender, node);
+
+        // What the sender says it transmits, read now rather than from the
+        // cache: a sender that was just switched on (by hand or by
+        // auto-activate) still has its disabled state in the snapshot.
+        // makeConnection checks the SDP against it.
+        await this.refreshSenderActive(senderId);
+        info.senderActive = this.nmosState.senderActiveData?.[senderId];
 
         if(sender.transport == "urn:x-nmos:transport:rtp.mcast"){
             info.transport = "rtp.mcast"
@@ -1815,6 +1863,42 @@ export class NmosRegistryConnector {
             }
         }
 
+        // The SSM source. The receiver joins (source, group) and the switch
+        // forwards exactly that — a source in the SDP that is not the address
+        // the packets really come from means a correct-looking route with no
+        // picture. The only frames that get through are the ones a switch
+        // floods while a stream (re)starts, i.e. about a second after the
+        // sender is toggled. The sender's IS-05 /active states the address it
+        // transmits from; where it names a real one and the SDP disagrees,
+        // the receiver gets the one from /active.
+        let sourceFixes: Array<{ leg:number, sdp:string, active:string }> = [];
+        let senderActiveLegs:any[] = Array.isArray(senderInfo.senderActive?.transport_params) ? senderInfo.senderActive.transport_params : [];
+        sdpLegs.forEach((leg, i) => {
+            let actual = senderActiveLegs[i]?.source_ip;
+            if(!leg.source_ip || !NmosRegistryConnector.isUnicastHost(actual) || actual === leg.source_ip){
+                return;
+            }
+            sourceFixes.push({ leg: i, sdp: leg.source_ip, active: actual });
+            leg.source_ip = actual;
+        });
+        if(sourceFixes.length > 0){
+            SyncLog.log("warning", "NMOS Connect", "Sender " + senderInfo.senderId + " announces a different source in its SDP than it " +
+                "transmits from according to its IS-05 /active — an SSM join on the SDP's address gets no packets. " +
+                "Receiver " + receiverId + " gets the address from /active.", { legs: sourceFixes });
+        }
+
+        // Two active senders on one group: the receiver gets both streams
+        // interleaved and shows nothing. Not our call to refuse the take,
+        // but it has to be in the log.
+        if(senderInfo.senderId && senderInfo.senderId != "disconnect"){
+            let clash = this.findMulticastConflict(senderInfo.senderId);
+            if(clash){
+                SyncLog.log("warning", "NMOS Connect", "Sender " + senderInfo.senderId + " transmits to " + clash.multicast +
+                    " (leg " + (clash.leg + 1) + "), which active sender " + clash.label + " uses as well — receiver " +
+                    receiverId + " will get both streams.");
+            }
+        }
+
         // The IS-05 control endpoints of the receiver's device. Resolved here
         // rather than just before the PATCH because the number of legs has to
         // be read from the device before transport_params can be built.
@@ -1883,6 +1967,12 @@ export class NmosRegistryConnector {
             if(this.settings.fixSdpBugs){
                 manifest = manifest.replace("colorimetry=UNSPECIFIED;", "colorimetry=BT709;");
                 manifest = manifest.replace("TCS=UNSPECIFIED;", "TCS=SDR;");
+            }
+
+            // The file must not contradict transport_params: a receiver that
+            // joins from the file would still pick the wrong source.
+            if(sourceFixes.length > 0){
+                manifest = NmosRegistryConnector.replaceSdpSources(manifest, sourceFixes);
             }
 
             // An empty manifest is not a transport file, it is a PATCH the
@@ -1993,93 +2083,90 @@ export class NmosRegistryConnector {
 
 
     async enableFlow(senderId:string, disable=false){
+        let versionFound = false;
+        let controlHrefs = [];
 
-        try{
-            let versionFound = false;
-            let controlHrefs = [];
-
-            let sender = this.nmosState.senders[senderId];
-            let device = this.nmosState.devices[sender.device_id];
-
-            let controlTypes = [{type:"urn:x-nmos:control:sr-ctrl/v1.1",version:"v1.1"}, {type:"urn:x-nmos:control:sr-ctrl/v1.0",version:"v1.0"}]
-
-            for(let type of controlTypes){
-                NmosRegistryConnector.controlsOf(device).forEach((control)=>{
-                    if(control.type == type.type){
-                        controlHrefs.push({href:control.href, version:type.version});
-                        versionFound = true;
-                    }
-                })
-                if(versionFound){
-                    break;
-                }
-            }
-
-            // How many legs a PATCH has to address.
-            let legCount = 1;
-            try{
-                // The cached IS-05 active snapshot decides, exactly as on the
-                // receiver side — interface_bindings only counts the
-                // interfaces the device bound and can report fewer legs than
-                // the device actually exposes.
-                let activeData = (this.nmosState as any).senderActiveData?.[senderId];
-                legCount = NmosRegistryConnector.legCountFromActive(activeData, sender);
-            }catch(e){}
-            if(legCount < 1){ legCount = 1; }
-
-            let rtpEnabled = !disable;
-            let transportParams:any[] = [];
-            for(let i=0;i<legCount;i++){
-                transportParams.push({ rtp_enabled: rtpEnabled });
-            }
-
-            let patch:any = {
-                "receiver_id": null,
-                "master_enable": !disable,
-                "activation": {
-                    "mode": "activate_immediate",
-                    "requested_time": null,
-                },
-                "transport_params": transportParams
-            };
-
-
-            for(let href of controlHrefs){
-                // TODO, version specific things
-                let fixSlash = ""
-                if(href.href[href.href.length-1] == "/"){
-                    fixSlash = ""
-                }else{
-                    fixSlash = "/"
-                }
-                let patchHref = href.href + fixSlash + "single/senders/" + senderId + "/staged";
-                try{
-                    let result = await axios.patch(patchHref, patch, {timeout:30000});
-                    SyncLog.log("success", "nmos", "Successfully enabled: "+senderId, {href:patchHref, data:patch, status:result?.status, response:result?.data})
-                    return;
-                }catch(e){
-                    if (axios.isAxiosError(e)) {
-                        if(e.code == "ETIMEDOUT"){
-                            // NEXT
-                            SyncLog.log("info", "nmos", "Patch on "+senderId+" timed out, trying next.");
-                        }else{
-                            // TODO....
-                            if(e.code == "ERR_BAD_REQUEST"){
-                                SyncLog.log("error", "nmos", "Sender "+senderId+" returned Error: "+e.code,{controlHrefs,failedControl:patchHref,patch, status:e.response?.status, error:e.response?.data,});
-                            }else{
-                                SyncLog.log("error", "nmos", "Sender "+senderId+" returned Error: "+e.code,{controlHrefs,failedControl:patchHref,patch, status:e.response?.status, error:e.response?.data, message:e.message});
-                            }
-                            return;
-                        }
-                    }else{
-                        return;
-                    }
-                }
-            }
-        }catch(e){
-
+        let sender = this.nmosState.senders[senderId];
+        let device = sender ? this.nmosState.devices[sender.device_id] : null;
+        if(!sender || !device){
+            let id = SyncLog.log("warning", "nmos", "Cannot " + (disable?"disable":"enable") + " sender " + senderId + ": not in the registry.");
+            throw new LoggedError("Sender not available in NMOS", id);
         }
 
+        let controlTypes = [{type:"urn:x-nmos:control:sr-ctrl/v1.1",version:"v1.1"}, {type:"urn:x-nmos:control:sr-ctrl/v1.0",version:"v1.0"}]
+
+        for(let type of controlTypes){
+            NmosRegistryConnector.controlsOf(device).forEach((control)=>{
+                if(control.type == type.type){
+                    controlHrefs.push({href:control.href, version:type.version});
+                    versionFound = true;
+                }
+            })
+            if(versionFound){
+                break;
+            }
+        }
+
+        // How many legs a PATCH has to address.
+        let legCount = 1;
+        try{
+            // The cached IS-05 active snapshot decides, exactly as on the
+            // receiver side — interface_bindings only counts the
+            // interfaces the device bound and can report fewer legs than
+            // the device actually exposes.
+            let activeData = (this.nmosState as any).senderActiveData?.[senderId];
+            legCount = NmosRegistryConnector.legCountFromActive(activeData, sender);
+        }catch(e){}
+        if(legCount < 1){ legCount = 1; }
+
+        let rtpEnabled = !disable;
+        let transportParams:any[] = [];
+        for(let i=0;i<legCount;i++){
+            transportParams.push({ rtp_enabled: rtpEnabled });
+        }
+
+        // No requested_time: IS-05 does not want one with activate_immediate,
+        // and strict devices reject the PATCH over a null (see makeConnection).
+        let patch:any = {
+            "receiver_id": null,
+            "master_enable": !disable,
+            "activation": {
+                "mode": "activate_immediate",
+            },
+            "transport_params": transportParams
+        };
+
+        // A refusal used to end here in silence — logged, but the caller was
+        // told nothing, so auto-activate went on to route a sender that never
+        // came up and the take "succeeded" without a picture. It throws now.
+        for(let href of controlHrefs){
+            // TODO, version specific things
+            let fixSlash = ""
+            if(href.href[href.href.length-1] == "/"){
+                fixSlash = ""
+            }else{
+                fixSlash = "/"
+            }
+            let patchHref = href.href + fixSlash + "single/senders/" + senderId + "/staged";
+            try{
+                let result = await axios.patch(patchHref, patch, {timeout:30000});
+                return SyncLog.log("success", "nmos", "Successfully " + (disable?"disabled":"enabled") + ": "+senderId, {href:patchHref, data:patch, status:result?.status, response:result?.data});
+            }catch(e){
+                if (axios.isAxiosError(e)) {
+                    if(e.code == "ETIMEDOUT"){
+                        // NEXT
+                        SyncLog.log("info", "nmos", "Patch on "+senderId+" timed out, trying next.");
+                        continue;
+                    }
+                    let id = SyncLog.log("error", "nmos", "Sender "+senderId+" returned Error: "+e.code,{controlHrefs,failedControl:patchHref,patch, status:e.response?.status, error:e.response?.data, message:e.message});
+                    let detail = e.response?.data?.error ? (e.response.data.error + (e.response.data.debug ? " / " + e.response.data.debug : "")) : e.message;
+                    throw new LoggedError("Sender refused " + (disable?"disable":"enable") + ": " + detail, id);
+                }
+                throw new LoggedError("Patch failed: " + (e as any)?.message);
+            }
+        }
+        let id = SyncLog.log("error", "nmos", "Sender Control unreachable.",{controlHrefs,patch});
+        throw new LoggedError("Sender Control unreachable.", id);
     }
 
 
@@ -2472,7 +2559,7 @@ export class NmosRegistryConnector {
                         if(href[href.length-1] !== "/"){ href += "/"; }
                         href += "single/senders/" + senderId + "/active/";
                         try{
-                            let response = await axios.get(href);
+                            let response = await axios.get(href, {timeout:5000});
                             this.nmosState.senderActiveData[senderId] = response.data;
                             return true;
                         }catch(e:any){
