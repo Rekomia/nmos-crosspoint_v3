@@ -641,6 +641,17 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                                         }
                                     }
 
+                                    // A vanished sender (kept in the shadow
+                                    // with available:false) can't be
+                                    // connected — every take on it fails. It
+                                    // must not take a receiver from a live
+                                    // flow, nor keep a device cell from ever
+                                    // reading as switched. (Mirrored in the
+                                    // UI preview, crosspoint.svelte.)
+                                    if(srcFlow.available === false){
+                                        connect = false;
+                                    }
+
                                     if(connect && !usedSources.includes(srcFlow.id)){
                                         if(connection.src == null){
                                             connection.src = srcFlow;
@@ -789,7 +800,10 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                 let autoActivate = !!(this.settings && this.settings.autoActivateInactiveSender);
                 if(autoActivate && src && src.id.startsWith("nmos_") && senderInfo && senderInfo.active === false){
                     let nmosId = src.id.slice(5);
-                    let conflict = await NmosRegistryConnector.instance.findMulticastConflictFresh(nmosId);
+                    // Checked on fresh device state and, when clear, claimed:
+                    // a sibling checked a moment later in the same take sees
+                    // this sender as on already.
+                    let conflict = await NmosRegistryConnector.instance.claimActivation(nmosId);
                     if(conflict){
                         let msg = "Multicast " + conflict.multicast + (conflict.port !== null ? ":" + conflict.port : "") +
                                   " (Leg " + (conflict.leg + 1) + ") is already in use by sender: " +
@@ -835,6 +849,10 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                         let msg = "Could not auto-activate sender: " + (e && e.message ? e.message : "unknown");
                         reject({src:src,dst:dst,status:"failed", detail:{message: msg, log:""}});
                         return;
+                    }finally{
+                        // Not awaited: the claim holds until the sender's own
+                        // IS-05 has been re-read, the take goes on meanwhile.
+                        NmosRegistryConnector.instance.releaseActivation(nmosId).catch(()=>{});
                     }
                 }
 
@@ -1446,8 +1464,12 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         // Also collects every ACTIVE sender per (leg index → multicast IP)
         // for duplicate detection. Primary and secondary legs are independent
         // failover paths, so the same group on leg 1 and leg 2 is fine —
-        // only two active senders on the SAME leg index clash.
-        let activeLegIps: { [legIndex:number]: { [ip:string]: Array<{id:string,label:string}> } } = {};
+        // only two active senders on the SAME leg index clash. Same rules as
+        // the auto-activate check (findMulticastConflict), so the badge never
+        // calls a conflict what a take just accepted: a stream is group AND
+        // port, and a leg that transmits nothing (silentSenderLegs) clashes
+        // with nothing.
+        let activeLegIps: { [legIndex:number]: { [ip:string]: Array<{id:string,label:string,port:string}> } } = {};
         let activeLegRefs: Array<{ leg:CrosspointFlowLeg, flowId:string }> = [];
         let senderInfoById: { [id:string]: { legs:CrosspointFlowLeg[], codec:string, format:string, bitrate:CrosspointFlowBitrate, label:string } } = {};
         for(let dev of this.crosspointState.devices){
@@ -1476,11 +1498,16 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
 
                     if(s.active){
                         let dLabel = (dev as CrosspointDevice).displayLabel || dev.alias || dev.name || "";
+                        let silent:number[] = [];
+                        try{
+                            silent = NmosRegistryConnector.silentSenderLegs(this.nmosState?.senders?.[nmosId],
+                                this.nmosState?.senderActiveData?.[nmosId], legs.length).map((x) => x.index);
+                        }catch(e){}
                         for(let l of legs){
-                            if(!l.dstIp) continue;
+                            if(!l.dstIp || silent.includes(l.index)) continue;
                             if(!activeLegIps[l.index]) activeLegIps[l.index] = {};
                             if(!activeLegIps[l.index][l.dstIp]) activeLegIps[l.index][l.dstIp] = [];
-                            activeLegIps[l.index][l.dstIp].push({ id: s.id, label: dLabel + " / " + (s.alias || s.name) });
+                            activeLegIps[l.index][l.dstIp].push({ id: s.id, label: dLabel + " / " + (s.alias || s.name), port: "" + (l.dstPort ?? "") });
                             activeLegRefs.push({ leg: l, flowId: s.id });
                         }
                     }
@@ -1501,7 +1528,10 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         // Legs are rebuilt from the NMOS state on every enrich, so stale
         // flags cannot survive a conflict being resolved.
         for(let ref of activeLegRefs){
-            let owners = activeLegIps[ref.leg.index]?.[ref.leg.dstIp] || [];
+            // Different known ports on one group are different streams.
+            let port = "" + (ref.leg.dstPort ?? "");
+            let owners = (activeLegIps[ref.leg.index]?.[ref.leg.dstIp] || [])
+                .filter(o => o.id === ref.flowId || o.port === "" || port === "" || o.port === port);
             if(owners.length > 1){
                 ref.leg.dup = true;
                 let others = owners.filter(o => o.id !== ref.flowId).map(o => o.label);

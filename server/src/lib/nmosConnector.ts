@@ -576,22 +576,28 @@ export class NmosRegistryConnector {
      *    0.0.0.0 means its interface has none: nothing can leave it. A
      *    Blackmagic 2110 sender binds both QSFP ports, keeps both legs
      *    rtp_enabled — the second cannot be switched off — and reports
-     *    exactly this on the unconfigured one.
+     *    exactly this on the unconfigured one. It only counts while another
+     *    leg of the sender has a real address: 0.0.0.0 on EVERY leg says
+     *    nothing about any of them — a device that resolves its addresses
+     *    only once switched on, or a virtual sender of our own node whose
+     *    SDP carries no source filter.
      *  - IS-05 /active has rtp_enabled per leg. That only counts while the
      *    sender as a whole is on: deactivating a sender switches every leg
      *    off, and a receiver routed to it now must still join all of them
      *    once it comes back.
      */
-    private static silentSenderLegs(sender:any, active:any, sdpLegCount:number):Array<{ index:number, reason:string }>{
+    static silentSenderLegs(sender:any, active:any, sdpLegCount:number):Array<{ index:number, reason:string }>{
         let out:Array<{ index:number, reason:string }> = [];
         let bindings = (sender && Array.isArray(sender.interface_bindings)) ? sender.interface_bindings : [];
         let resolved = (active && Array.isArray(active.transport_params)) ? active.transport_params : [];
         let params = (active && active.master_enable === true) ? resolved : [];
+        let noAddress = (ip:any) => ip === "0.0.0.0" || ip === "::";
+        let anyAddress = resolved.some((tp:any) => tp && typeof tp.source_ip === "string" && tp.source_ip !== "" && tp.source_ip !== "auto" && !noAddress(tp.source_ip));
         for(let i = 0; i < sdpLegCount; i++){
             let source = resolved[i] ? resolved[i].source_ip : undefined;
             if(bindings.length > 0 && i >= bindings.length){
                 out.push({ index:i, reason:"the sender binds " + bindings.length + " interface(s) in IS-04, none for this leg" });
-            }else if(source === "0.0.0.0" || source === "::"){
+            }else if(anyAddress && noAddress(source)){
                 out.push({ index:i, reason:"the sender has no source address on this leg (source_ip " + source + ")" });
             }else if(params[i] && params[i].rtp_enabled === false){
                 out.push({ index:i, reason:"rtp_enabled is false on this leg of the active sender" });
@@ -1724,10 +1730,45 @@ export class NmosRegistryConnector {
         return ips;
     }
 
+    // Senders an auto-activation has cleared and is switching on right now.
+    // Until the device and IS-04 report them on, the check could not see
+    // them, and two siblings of one take would both pass on the same stream.
+    private pendingActivations:Set<string> = new Set<string>();
+
+    private static portOf(tp:any):number|null{
+        return (typeof tp?.destination_port === "number" && tp.destination_port > 0) ? tp.destination_port : null;
+    }
+
     /**
-     * Find whether the given sender's streams collide with any *other*
-     * currently active sender on the same leg index. Returns null if there's
-     * no conflict, otherwise returns the offending sender's label, id, the
+     * The legs of `senderId` that will transmit once it is switched on, with
+     * their stream (group + port). Activation switches every leg on, so its
+     * rtp_enabled does not count — only an interface binding and a source
+     * address do. Should that leave nothing (bindings and addresses that
+     * contradict each other), the bound legs are checked rather than none.
+     */
+    private legsToClaim(senderId:string):Array<{ index:number, ip:string, port:number|null }>{
+        let active:any = (this.nmosState as any).senderActiveData?.[senderId];
+        if(!active || !Array.isArray(active.transport_params)){ return []; }
+        let sender = this.nmosState.senders[senderId];
+        let candidates: Array<{ index:number, ip:string, port:number|null }> = [];
+        active.transport_params.forEach((tp:any, index:number)=>{
+            if(tp && typeof tp.destination_ip === "string" && tp.destination_ip){
+                candidates.push({ index, ip: tp.destination_ip, port: NmosRegistryConnector.portOf(tp) });
+            }
+        });
+        let silent = NmosRegistryConnector.silentSenderLegs(sender, { ...active, master_enable: false }, active.transport_params.length).map((l) => l.index);
+        let legs = candidates.filter((l) => !silent.includes(l.index));
+        if(legs.length === 0){
+            let bindings = (sender && Array.isArray(sender.interface_bindings)) ? sender.interface_bindings : [];
+            legs = candidates.filter((l) => bindings.length === 0 || l.index < bindings.length);
+        }
+        return legs;
+    }
+
+    /**
+     * Find whether the given sender's streams collide with any *other* sender
+     * that is on the wire, on the same leg index. Returns null if there's no
+     * conflict, otherwise returns the offending sender's label, id, the
      * conflicting leg index, the multicast IP and the port.
      *
      * Same-sender legs do NOT conflict with each other (primary/secondary
@@ -1738,62 +1779,46 @@ export class NmosRegistryConnector {
      * group tell its streams apart by port, so a device may well put the
      * video, audio and ANC of one channel on one group. Comparing the
      * address alone made every such sibling essence of an already running
-     * channel a "conflict", and auto-activate refused it.
+     * channel a "conflict", and auto-activate refused it. Where a port is
+     * unknown, the address alone decides.
      *
-     * A leg that transmits nothing collides with nothing — on either side:
-     * no interface bound for it, no source address (0.0.0.0), or, on the
-     * running sender, rtp_enabled off. Unused legs often keep a factory
-     * default group that every unit of a model shares (239.255.66.113 on
-     * each Blackmagic audio sender's second leg). Our own rtp_enabled does
-     * not count: activating the sender switches every leg on. Nor does our
-     * own 0.0.0.0 when EVERY leg shows it — a device may only resolve its
-     * source addresses once it is switched on, and then nothing at all
-     * would be checked.
+     * A leg that transmits nothing collides with nothing — on either side
+     * (silentSenderLegs): no interface bound for it, no source address while
+     * another leg has one, or, on a running sender, rtp_enabled off. Unused
+     * legs often keep a factory default group that every unit of a model
+     * shares (239.255.66.113 on each Blackmagic audio sender's second leg).
      *
-     * Works on the cached IS-05 snapshots; findMulticastConflictFresh
-     * re-reads the devices before a refusal.
+     * "On the wire" is the device's own IS-05 master_enable; IS-04's
+     * subscription.active only where the snapshot has none. A sender another
+     * auto-activation is switching on right now counts as on, judged like
+     * ours (its rtp_enabled does not count).
+     *
+     * Works on the cached snapshots; claimActivation re-reads the devices
+     * first.
      */
     findMulticastConflict(senderId:string): { id:string, label:string, leg:number, multicast:string, port:number|null } | null {
         try{
-            let activeData:any = (this.nmosState as any).senderActiveData?.[senderId];
-            if(!activeData || !Array.isArray(activeData.transport_params)){
-                return null;
-            }
-            let portOf = (tp:any):number|null => (typeof tp?.destination_port === "number" && tp.destination_port > 0) ? tp.destination_port : null;
-            let silentOf = (sender:any, active:any):number[] =>
-                NmosRegistryConnector.silentSenderLegs(sender, active, active.transport_params.length).map((l) => l.index);
-            // Build the list of streams we want to claim, per leg index.
-            let ourSilent = silentOf(this.nmosState.senders[senderId], activeData);
-            let candidates: Array<{ index:number, ip:string, port:number|null }> = [];
-            activeData.transport_params.forEach((tp:any, index:number)=>{
-                if(tp && typeof tp.destination_ip === "string" && tp.destination_ip){
-                    candidates.push({ index, ip: tp.destination_ip, port: portOf(tp) });
-                }
-            });
-            let ourLegs = candidates.filter((l) => !ourSilent.includes(l.index));
-            if(ourLegs.length === 0){
-                ourLegs = candidates;
-            }
+            let ourLegs = this.legsToClaim(senderId);
             if(ourLegs.length === 0){
                 return null;
             }
-            // Iterate every OTHER sender that is currently active.
             for(let otherId in this.nmosState.senders){
                 if(otherId === senderId){ continue; }
                 let other = this.nmosState.senders[otherId];
-                if(!other || !other.subscription || !other.subscription.active){
-                    continue;
-                }
                 let otherActive:any = (this.nmosState as any).senderActiveData?.[otherId];
-                if(!otherActive || !Array.isArray(otherActive.transport_params)){
+                if(!other || !otherActive || !Array.isArray(otherActive.transport_params)){
                     continue;
                 }
-                // IS-04 says active, the device's own IS-05 says off: the
-                // registry is behind, nothing is on the wire.
-                if(otherActive.master_enable === false){
+                let pending = !!this.pendingActivations?.has(otherId);
+                let onAir = pending || ((typeof otherActive.master_enable === "boolean")
+                    ? otherActive.master_enable
+                    : !!(other.subscription && other.subscription.active));
+                if(!onAir){
                     continue;
                 }
-                let otherSilent = silentOf(other, otherActive);
+                let otherSilent = NmosRegistryConnector.silentSenderLegs(other,
+                    pending ? { ...otherActive, master_enable: false } : otherActive,
+                    otherActive.transport_params.length).map((l) => l.index);
                 for(let leg of ourLegs){
                     if(otherSilent.includes(leg.index)){ continue; }
                     let tp = otherActive.transport_params[leg.index];
@@ -1802,7 +1827,7 @@ export class NmosRegistryConnector {
                     }
                     // Different ports on one group are two streams. Only
                     // where a port is unknown does the address alone decide.
-                    let otherPort = portOf(tp);
+                    let otherPort = NmosRegistryConnector.portOf(tp);
                     if(leg.port !== null && otherPort !== null && leg.port !== otherPort){
                         continue;
                     }
@@ -1830,16 +1855,24 @@ export class NmosRegistryConnector {
         return null;
     }
 
-
     /**
-     * findMulticastConflict on the devices' current state. The snapshots
-     * only move with IS-04 events, and a change made on the device itself
-     * (a multicast, a leg switched off) need not produce one. Our own sender
-     * is re-read before the check; every sender it collides with is re-read
-     * and checked again, so a refusal never rests on a stale cache. A device
-     * that does not answer keeps its cached snapshot.
+     * The check before an auto-activation, on the devices' current state,
+     * and the claim that makes it hold until the sender is on.
+     *
+     * The snapshots only move with IS-04 events, and a change made on the
+     * device itself (a multicast, a port, a leg or the whole sender switched
+     * off) need not produce one. So our sender is re-read, and so is every
+     * sender with one of our groups on the same leg — BEFORE any exemption
+     * (port, silent leg, switched off) is judged, so none of them rests on a
+     * stale cache, in either direction. A device that does not answer keeps
+     * its cached snapshot.
+     *
+     * When nothing collides, the sender is marked as being switched on in
+     * the same synchronous step as the check, so a sibling checked a moment
+     * later in the same take sees it. The caller must releaseActivation()
+     * once the activation is through, successful or not.
      */
-    async findMulticastConflictFresh(senderId:string): Promise<ReturnType<NmosRegistryConnector["findMulticastConflict"]>> {
+    async claimActivation(senderId:string): Promise<ReturnType<NmosRegistryConnector["findMulticastConflict"]>> {
         let readOne = async (id:string) => {
             try{
                 let s = this.nmosState.senders[id];
@@ -1847,16 +1880,35 @@ export class NmosRegistryConnector {
             }catch(e){}
         };
         await readOne(senderId);
+        let ours = this.legsToClaim(senderId);
+        let sharing:string[] = [];
+        for(let otherId in this.nmosState.senders){
+            if(otherId === senderId){ continue; }
+            let tps = (this.nmosState as any).senderActiveData?.[otherId]?.transport_params;
+            if(!Array.isArray(tps)){ continue; }
+            if(ours.some((l) => tps[l.index] && tps[l.index].destination_ip === l.ip)){
+                sharing.push(otherId);
+            }
+        }
+        await Promise.all(sharing.map(readOne));
         let conflict = this.findMulticastConflict(senderId);
-        // The re-read one may turn out clear and the next match be another
-        // sender — each one gets its own fresh look before it counts.
-        let reread = new Set<string>();
-        while(conflict && !reread.has(conflict.id)){
-            reread.add(conflict.id);
-            await readOne(conflict.id);
-            conflict = this.findMulticastConflict(senderId);
+        if(!conflict){
+            this.pendingActivations.add(senderId);
         }
         return conflict;
+    }
+
+    /**
+     * End of a claim. The sender's snapshot is re-read first, so that from
+     * here on its own IS-05 says it is on even where IS-04 lags behind; only
+     * then does the claim go. The take need not wait for it.
+     */
+    async releaseActivation(senderId:string):Promise<void>{
+        try{
+            let s = this.nmosState.senders[senderId];
+            if(s){ await this.readSenderActive(senderId, this.nmosState.devices[s.device_id]); }
+        }catch(e){}
+        this.pendingActivations.delete(senderId);
     }
 
 
