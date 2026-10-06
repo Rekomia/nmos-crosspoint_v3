@@ -568,10 +568,15 @@ export class NmosRegistryConnector {
      * input refuses the whole PATCH ("cannot have differing redundant
      * information"), primary leg included.
      *
-     * The sender says itself which legs are real, in two places:
+     * The sender says itself which legs are real, in three places:
      *  - IS-04 interface_bindings names one interface per leg in use. A leg
      *    past the end of that list is not wired to anything. Only v1.2+
      *    resources have the field; without it nothing is ruled out.
+     *  - IS-05 /active resolves source_ip to the address the leg sends from.
+     *    0.0.0.0 means its interface has none: nothing can leave it. A
+     *    Blackmagic 2110 sender binds both QSFP ports, keeps both legs
+     *    rtp_enabled — the second cannot be switched off — and reports
+     *    exactly this on the unconfigured one.
      *  - IS-05 /active has rtp_enabled per leg. That only counts while the
      *    sender as a whole is on: deactivating a sender switches every leg
      *    off, and a receiver routed to it now must still join all of them
@@ -580,10 +585,14 @@ export class NmosRegistryConnector {
     private static silentSenderLegs(sender:any, active:any, sdpLegCount:number):Array<{ index:number, reason:string }>{
         let out:Array<{ index:number, reason:string }> = [];
         let bindings = (sender && Array.isArray(sender.interface_bindings)) ? sender.interface_bindings : [];
-        let params = (active && active.master_enable === true && Array.isArray(active.transport_params)) ? active.transport_params : [];
+        let resolved = (active && Array.isArray(active.transport_params)) ? active.transport_params : [];
+        let params = (active && active.master_enable === true) ? resolved : [];
         for(let i = 0; i < sdpLegCount; i++){
+            let source = resolved[i] ? resolved[i].source_ip : undefined;
             if(bindings.length > 0 && i >= bindings.length){
                 out.push({ index:i, reason:"the sender binds " + bindings.length + " interface(s) in IS-04, none for this leg" });
+            }else if(source === "0.0.0.0" || source === "::"){
+                out.push({ index:i, reason:"the sender has no source address on this leg (source_ip " + source + ")" });
             }else if(params[i] && params[i].rtp_enabled === false){
                 out.push({ index:i, reason:"rtp_enabled is false on this leg of the active sender" });
             }
