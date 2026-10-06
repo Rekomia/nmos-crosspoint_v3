@@ -894,13 +894,20 @@
             // again. Nothing ever came apart again from a device cell.
             // connectedFlow is read from OUR state, not from the response: the
             // response describes what a connect WOULD do.
-            let allActive = newList.length > 0 && newList.every((n:any)=>{
-              if(!n.src || !n.dst) return false;
+            // Only the pairs a connect would MAKE decide it. A receiver flow
+            // the sender has no match for comes back with src null — a
+            // connect disconnects it. Counting those made every pair of
+            // devices with different flow counts look "not switched", so the
+            // second click took the same connections again (each one dropped
+            // and re-patched) instead of switching them off. The OFF click
+            // likewise only parts what this device pair connected.
+            let pairs = newList.filter((n:any)=> n.src && n.dst);
+            let allActive = pairs.length > 0 && pairs.every((n:any)=>{
               let live = findReceiverFlowById(n.dst.id);
               return !!live && live.connectedFlow === n.src.id;
             });
             if(allActive){
-              cleanPreparedConnections(newList.map((n:any)=>({ srcDev: null, src: null, dstDev: n.dstDev, dst: n.dst })));
+              cleanPreparedConnections(pairs.map((n:any)=>({ srcDev: null, src: null, dstDev: n.dstDev, dst: n.dst })));
               if(autoTake) takeConnect();
               refreshMatrix(); updateGlobalTake();
               return;

@@ -788,7 +788,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                     let nmosId = src.id.slice(5);
                     let conflict = NmosRegistryConnector.instance.findMulticastConflict(nmosId);
                     if(conflict){
-                        let msg = "Multicast " + conflict.multicast +
+                        let msg = "Multicast " + conflict.multicast + (conflict.port !== null ? ":" + conflict.port : "") +
                                   " (Leg " + (conflict.leg + 1) + ") is already in use by sender: " +
                                   conflict.label;
                         SyncLog.log("warning", "connect_crosspoint", "Refusing to auto-activate " + src.id + " — " + msg);

@@ -1725,26 +1725,43 @@ export class NmosRegistryConnector {
     }
 
     /**
-     * Find whether the given sender's multicast IPs collide with any *other*
+     * Find whether the given sender's streams collide with any *other*
      * currently active sender on the same leg index. Returns null if there's
      * no conflict, otherwise returns the offending sender's label, id, the
-     * conflicting leg index and the multicast IP.
+     * conflicting leg index, the multicast IP and the port.
      *
      * Same-sender legs do NOT conflict with each other (primary/secondary
      * failover is allowed to use the same multicast). Cross-leg comparison
      * is also allowed — only leg 0 of one sender vs leg 0 of another etc.
+     *
+     * A stream is a multicast group AND a UDP port: receivers that join one
+     * group tell its streams apart by port, so a device may well put the
+     * video, audio and ANC of one channel on one group. Comparing the
+     * address alone made every such sibling essence of an already running
+     * channel a "conflict", and auto-activate refused it.
+     *
+     * A leg that transmits nothing collides with nothing — on either side:
+     * no interface bound for it, no source address (0.0.0.0), or, on the
+     * running sender, rtp_enabled off. Unused legs often keep a factory
+     * default group that every unit of a model shares (239.255.66.113 on
+     * each Blackmagic audio sender's second leg). Our own rtp_enabled does
+     * not count: activating the sender switches every leg on.
      */
-    findMulticastConflict(senderId:string): { id:string, label:string, leg:number, multicast:string } | null {
+    findMulticastConflict(senderId:string): { id:string, label:string, leg:number, multicast:string, port:number|null } | null {
         try{
             let activeData:any = (this.nmosState as any).senderActiveData?.[senderId];
             if(!activeData || !Array.isArray(activeData.transport_params)){
                 return null;
             }
-            // Build the list of multicasts we want to claim, per leg index.
-            let ourLegs: Array<{ index:number, ip:string }> = [];
+            let portOf = (tp:any):number|null => (typeof tp?.destination_port === "number" && tp.destination_port > 0) ? tp.destination_port : null;
+            let silentOf = (sender:any, active:any):number[] =>
+                NmosRegistryConnector.silentSenderLegs(sender, active, active.transport_params.length).map((l) => l.index);
+            // Build the list of streams we want to claim, per leg index.
+            let ourSilent = silentOf(this.nmosState.senders[senderId], activeData);
+            let ourLegs: Array<{ index:number, ip:string, port:number|null }> = [];
             activeData.transport_params.forEach((tp:any, index:number)=>{
-                if(tp && typeof tp.destination_ip === "string" && tp.destination_ip){
-                    ourLegs.push({ index, ip: tp.destination_ip });
+                if(tp && typeof tp.destination_ip === "string" && tp.destination_ip && !ourSilent.includes(index)){
+                    ourLegs.push({ index, ip: tp.destination_ip, port: portOf(tp) });
                 }
             });
             if(ourLegs.length === 0){
@@ -1761,19 +1778,34 @@ export class NmosRegistryConnector {
                 if(!otherActive || !Array.isArray(otherActive.transport_params)){
                     continue;
                 }
+                let otherSilent = silentOf(other, otherActive);
                 for(let leg of ourLegs){
+                    if(otherSilent.includes(leg.index)){ continue; }
                     let tp = otherActive.transport_params[leg.index];
-                    if(tp && typeof tp.destination_ip === "string" && tp.destination_ip === leg.ip){
-                        let label = other.label || otherId;
-                        // Add device label as prefix for context
-                        try{
-                            let dev = this.nmosState.devices[other.device_id];
-                            if(dev && dev.label){
-                                label = dev.label + " / " + label;
-                            }
-                        }catch(e){}
-                        return { id: otherId, label, leg: leg.index, multicast: leg.ip };
+                    if(!tp || typeof tp.destination_ip !== "string" || tp.destination_ip !== leg.ip){
+                        continue;
                     }
+                    // Different ports on one group are two streams. Only
+                    // where a port is unknown does the address alone decide.
+                    let otherPort = portOf(tp);
+                    if(leg.port !== null && otherPort !== null && leg.port !== otherPort){
+                        continue;
+                    }
+                    let label = other.label || otherId;
+                    // Add device label as prefix for context
+                    try{
+                        let dev = this.nmosState.devices[other.device_id];
+                        if(dev && dev.label){
+                            label = dev.label + " / " + label;
+                        }
+                    }catch(e){}
+                    // Devices that give every sender the device's name (as
+                    // Blackmagic does) only tell them apart in the
+                    // description — "…: Audio".
+                    if(typeof other.description === "string" && other.description && !label.includes(other.description)){
+                        label += " (" + other.description + ")";
+                    }
+                    return { id: otherId, label, leg: leg.index, multicast: leg.ip, port: leg.port ?? otherPort };
                 }
             }
         }catch(e){}
