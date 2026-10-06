@@ -855,8 +855,9 @@
 
 
         if(src && dst){
-          // Aktiver Punkt → Toggle Disconnect
-          if(dst.connectedFlow === src.id){
+          // Aktiver Punkt → Toggle Disconnect. Judged like the device cell:
+          // a take still in flight counts as done.
+          if(effectiveConnectedFlow(dst) === src.id){
             let idx = preparedConnectList.findIndex(c => !c.src && c.dst?.id === dst.id);
             if(idx !== -1){ preparedConnectList.splice(idx, 1); preparedConnectList = preparedConnectList; }
             else{
@@ -894,13 +895,9 @@
             // again. Nothing ever came apart again from a device cell.
             // connectedFlow is read from OUR state, not from the response: the
             // response describes what a connect WOULD do.
-            let off = cellOffTargets(newList, sourceIdsOf(srcDev, src));
-            if(off){
-              cleanPreparedConnections(off.map((n:any)=>({ srcDev: null, src: null, dstDev: n.dstDev, dst: n.dst })));
-              if(autoTake) takeConnect();
-              refreshMatrix(); updateGlobalTake();
-              return;
-            }
+            // With AutoTake off a click stages; a second click on the same
+            // cell withdraws what it staged — a connect, or an OFF — before
+            // anything is judged against the live state.
             let allPrepared = newList.length > 0 && newList.every(n =>
               preparedConnectList.some((c:any) => c.src?.id === n.src?.id && c.dst?.id === n.dst?.id)
             );
@@ -908,10 +905,23 @@
               preparedConnectList = preparedConnectList.filter((c:any) =>
                 !newList.some(n => c.src?.id === n.src?.id && c.dst?.id === n.dst?.id)
               );
-            }else{
-              cleanPreparedConnections(newList);
-              if(autoTake) takeConnect();
+              refreshMatrix(); updateGlobalTake();
+              return;
             }
+            let off = cellOffTargets(newList, sourceIdsOf(srcDev, src));
+            if(off && off.length > 0 && off.every((n:any)=> preparedConnectList.some((c:any)=> !c.src && c.dst?.id === n.dst.id))){
+              preparedConnectList = preparedConnectList.filter((c:any)=> !(!c.src && off!.some((n:any)=> n.dst.id === c.dst?.id)));
+              refreshMatrix(); updateGlobalTake();
+              return;
+            }
+            if(off){
+              cleanPreparedConnections(off.map((n:any)=>({ srcDev: null, src: null, dstDev: n.dstDev, dst: n.dst })));
+              if(autoTake) takeConnect();
+              refreshMatrix(); updateGlobalTake();
+              return;
+            }
+            cleanPreparedConnections(newList);
+            if(autoTake) takeConnect();
             refreshMatrix(); updateGlobalTake();
           }).catch((e)=>{
             // TODO, error handling
@@ -926,8 +936,11 @@
 
 
     export function takeConnect(){
-      doConnect(preparedConnectList);
-      workingConnectList = preparedConnectList;
+      // Takes overlap: each one ADDS its entries and, on its answer, removes
+      // only its own (doConnect) — another take's in-flight entries stay.
+      let take = preparedConnectList;
+      workingConnectList = workingConnectList.concat(take);
+      doConnect(take);
       preparedConnectList = [];
       refreshMatrix();
       updateGlobalTake();
@@ -1186,7 +1199,11 @@
 
       if((srcFlows.length > 0 || disconnect) && dstFlows.length > 0){
         let usedSources:any[] = [];
-        for(let dstFlow of dstFlows){
+        // Same as the server: live flows first on both sides, unavailable
+        // ones only get what is left.
+        let liveFirst = (flows:any[]) => flows.filter((f:any)=> f.available !== false).concat(flows.filter((f:any)=> f.available === false));
+        let rank = (f:any) => (f.available === false ? 1 : 0);
+        for(let dstFlow of liveFirst(dstFlows)){
           let picked:any = null;
           if(!disconnect){
             for(let srcFlow of srcFlows){
@@ -1195,15 +1212,12 @@
               else if(dstFlow.type == "video" && srcFlow.type == "video"){ connect = true; }
               else if(dstFlow.type == "data"){ if(srcFlow.type == "data"){ connect = true; } }
               else if(dstFlow.type == srcFlow.type){ connect = true; }
-              // A vanished sender can't be connected; it must not take a
-              // receiver from a live one (same as the server).
-              if(srcFlow.available === false){ connect = false; }
 
               if(connect && !usedSources.includes(srcFlow.id)){
                 if(picked == null){
                   picked = srcFlow;
                   usedSources.push(srcFlow.id);
-                }else if(picked.num > srcFlow.num){
+                }else if(rank(srcFlow) < rank(picked) || (rank(srcFlow) === rank(picked) && picked.num > srcFlow.num)){
                   // Same as the server: the earlier pick is free again,
                   // the replacement is taken.
                   usedSources = usedSources.filter((id:any)=> id !== picked.id);
@@ -1234,10 +1248,10 @@
       // TODO Activating....
       ServerConnector.post("makeconnection", {multiple:reducedList,preview:false}).then((response:any)=>{
         showConnectResponse(response.data);
-        workingConnectList = [];
+        workingConnectList = workingConnectList.filter((c:any)=> !list.includes(c));
         refreshMatrix();
       }).catch((e)=>{
-        workingConnectList = [];
+        workingConnectList = workingConnectList.filter((c:any)=> !list.includes(c));
         refreshMatrix();
       });
       // TODO error
@@ -1278,9 +1292,10 @@
             if( flow.id == c.dst?.id ){ return "workingdisconnect" }
         }
       }
+      // Preview entries carry plain ids, not flow objects.
       for(let c of previewConnectList){
         if(!c.src && c.dst){
-            if( flow.id == c.dst?.id ){ return "previewdisconnect" }
+            if( flow.id == (typeof c.dst === "string" ? c.dst : c.dst?.id) ){ return "previewdisconnect" }
         }
       }
       return false

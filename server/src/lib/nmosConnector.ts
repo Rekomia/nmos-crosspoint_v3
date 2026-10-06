@@ -535,9 +535,10 @@ export class NmosRegistryConnector {
      * A sender's IS-05 active parameters, read straight from the device and
      * written back into the cache. The cached snapshot only moves when IS-04
      * reports a change, and switching a leg on or off need not touch IS-04.
-     * Falls back to the cache when no control endpoint answers.
+     * Falls back to the cache when no control endpoint answers; `fresh`, when
+     * given, collects the ids that WERE read from the device.
      */
-    private async readSenderActive(senderId:string, device:any):Promise<any|null>{
+    private async readSenderActive(senderId:string, device:any, fresh?:Set<string>):Promise<any|null>{
         let preferred = ["urn:x-nmos:control:sr-ctrl/v1.1", "urn:x-nmos:control:sr-ctrl/v1.0"];
         for(let ctrlType of preferred){
             for(let c of NmosRegistryConnector.controlsOf(device)){
@@ -549,6 +550,7 @@ export class NmosRegistryConnector {
                     const response = await axios.get(href, {timeout:5000});
                     if(response && response.data){
                         this.nmosState.senderActiveData[senderId] = response.data;
+                        if(fresh){ fresh.add(senderId); }
                         return response.data;
                     }
                 }catch(e){}
@@ -1730,13 +1732,33 @@ export class NmosRegistryConnector {
         return ips;
     }
 
-    // Senders an auto-activation has cleared and is switching on right now.
-    // Until the device and IS-04 report them on, the check could not see
-    // them, and two siblings of one take would both pass on the same stream.
-    private pendingActivations:Set<string> = new Set<string>();
+    // Senders an auto-activation has cleared and is switching on right now,
+    // with the time of the claim. Until the device and IS-04 report them on,
+    // the check could not see them, and two siblings of one take would both
+    // pass on the same stream. A claim that is never released (a take that
+    // hung) expires, so it can't block its stream for good.
+    private pendingActivations:Map<string, number> = new Map<string, number>();
+    private static readonly CLAIM_TTL_MS = 60000;
+
+    private isPending(senderId:string):boolean{
+        let since = this.pendingActivations?.get(senderId);
+        if(since === undefined){ return false; }
+        if(Date.now() - since > NmosRegistryConnector.CLAIM_TTL_MS){
+            this.pendingActivations.delete(senderId);
+            return false;
+        }
+        return true;
+    }
 
     private static portOf(tp:any):number|null{
         return (typeof tp?.destination_port === "number" && tp.destination_port > 0) ? tp.destination_port : null;
+    }
+
+    // An address that names something. "auto" (never resolved), empty or
+    // unspecified does not: as a destination it is no stream and collides
+    // with nothing, as a source it is no interface address.
+    private static isResolved(ip:any):boolean{
+        return typeof ip === "string" && ip !== "" && ip !== "auto" && ip !== "0.0.0.0" && ip !== "::";
     }
 
     /**
@@ -1752,7 +1774,7 @@ export class NmosRegistryConnector {
         let sender = this.nmosState.senders[senderId];
         let candidates: Array<{ index:number, ip:string, port:number|null }> = [];
         active.transport_params.forEach((tp:any, index:number)=>{
-            if(tp && typeof tp.destination_ip === "string" && tp.destination_ip){
+            if(tp && NmosRegistryConnector.isResolved(tp.destination_ip)){
                 candidates.push({ index, ip: tp.destination_ip, port: NmosRegistryConnector.portOf(tp) });
             }
         });
@@ -1763,6 +1785,22 @@ export class NmosRegistryConnector {
             legs = candidates.filter((l) => bindings.length === 0 || l.index < bindings.length);
         }
         return legs;
+    }
+
+    /**
+     * The leg indices a sender that is being switched on right now counts
+     * with. Its snapshot is from before the activation, so its legs are only
+     * certain where it already shows a source address. A device that resolves
+     * its addresses only once on shows none at all; then only its first leg
+     * counts — the one every sender transmits on — and not a second leg that
+     * may well stay unused on the factory default group its siblings share.
+     */
+    private pendingLegIndices(sender:any, active:any):number[]{
+        let tps:any[] = Array.isArray(active?.transport_params) ? active.transport_params : [];
+        let bindings = (sender && Array.isArray(sender.interface_bindings)) ? sender.interface_bindings : [];
+        let bound = (i:number) => bindings.length === 0 || i < bindings.length;
+        let withAddress = tps.map((tp:any, i:number) => i).filter((i) => bound(i) && NmosRegistryConnector.isResolved(tps[i]?.source_ip));
+        return withAddress.length > 0 ? withAddress : (tps.length > 0 ? [0] : []);
     }
 
     /**
@@ -1780,7 +1818,8 @@ export class NmosRegistryConnector {
      * video, audio and ANC of one channel on one group. Comparing the
      * address alone made every such sibling essence of an already running
      * channel a "conflict", and auto-activate refused it. Where a port is
-     * unknown, the address alone decides.
+     * unknown, the address alone decides. "auto" or an unspecified address
+     * is no stream at all.
      *
      * A leg that transmits nothing collides with nothing — on either side
      * (silentSenderLegs): no interface bound for it, no source address while
@@ -1788,15 +1827,16 @@ export class NmosRegistryConnector {
      * legs often keep a factory default group that every unit of a model
      * shares (239.255.66.113 on each Blackmagic audio sender's second leg).
      *
-     * "On the wire" is the device's own IS-05 master_enable; IS-04's
-     * subscription.active only where the snapshot has none. A sender another
-     * auto-activation is switching on right now counts as on, judged like
-     * ours (its rtp_enabled does not count).
+     * On the wire: a sender another auto-activation is switching on right
+     * now (pendingLegIndices); otherwise the device's own IS-05
+     * master_enable when it was read just now (`fresh`), else IS-04's
+     * subscription.active — a cached snapshot the device could not confirm
+     * does not outrank the registry. Pre-v1.2 senders have no subscription;
+     * for them the snapshot is all there is.
      *
-     * Works on the cached snapshots; claimActivation re-reads the devices
-     * first.
+     * claimActivation re-reads the devices and passes `fresh`.
      */
-    findMulticastConflict(senderId:string): { id:string, label:string, leg:number, multicast:string, port:number|null } | null {
+    findMulticastConflict(senderId:string, fresh?:Set<string>): { id:string, label:string, leg:number, multicast:string, port:number|null } | null {
         try{
             let ourLegs = this.legsToClaim(senderId);
             if(ourLegs.length === 0){
@@ -1809,20 +1849,27 @@ export class NmosRegistryConnector {
                 if(!other || !otherActive || !Array.isArray(otherActive.transport_params)){
                     continue;
                 }
-                let pending = !!this.pendingActivations?.has(otherId);
-                let onAir = pending || ((typeof otherActive.master_enable === "boolean")
-                    ? otherActive.master_enable
-                    : !!(other.subscription && other.subscription.active));
+                let pending = this.isPending(otherId);
+                let is04:boolean|null = other.subscription ? !!other.subscription.active : null;
+                let is05:boolean|null = (typeof otherActive.master_enable === "boolean") ? otherActive.master_enable : null;
+                let onAir = pending
+                    || ((fresh && fresh.has(otherId) && is05 !== null) ? is05
+                    : (is04 !== null) ? is04
+                    : is05 === true);
                 if(!onAir){
                     continue;
                 }
-                let otherSilent = NmosRegistryConnector.silentSenderLegs(other,
-                    pending ? { ...otherActive, master_enable: false } : otherActive,
-                    otherActive.transport_params.length).map((l) => l.index);
+                let otherCounts:number[];
+                if(pending){
+                    otherCounts = this.pendingLegIndices(other, otherActive);
+                }else{
+                    let silent = NmosRegistryConnector.silentSenderLegs(other, otherActive, otherActive.transport_params.length).map((l) => l.index);
+                    otherCounts = otherActive.transport_params.map((tp:any, i:number) => i).filter((i:number) => !silent.includes(i));
+                }
                 for(let leg of ourLegs){
-                    if(otherSilent.includes(leg.index)){ continue; }
+                    if(!otherCounts.includes(leg.index)){ continue; }
                     let tp = otherActive.transport_params[leg.index];
-                    if(!tp || typeof tp.destination_ip !== "string" || tp.destination_ip !== leg.ip){
+                    if(!tp || !NmosRegistryConnector.isResolved(tp.destination_ip) || tp.destination_ip !== leg.ip){
                         continue;
                     }
                     // Different ports on one group are two streams. Only
@@ -1860,23 +1907,25 @@ export class NmosRegistryConnector {
      * and the claim that makes it hold until the sender is on.
      *
      * The snapshots only move with IS-04 events, and a change made on the
-     * device itself (a multicast, a port, a leg or the whole sender switched
-     * off) need not produce one. So our sender is re-read, and so is every
-     * sender with one of our groups on the same leg — BEFORE any exemption
-     * (port, silent leg, switched off) is judged, so none of them rests on a
-     * stale cache, in either direction. A device that does not answer keeps
-     * its cached snapshot.
+     * device itself (a multicast, a leg or the whole sender switched off)
+     * need not produce one. So our sender is re-read, and so is every sender
+     * with one of our streams on the same leg — BEFORE any exemption (silent
+     * leg, switched off) is judged, so none of them rests on a stale cache,
+     * in either direction. A device that does not answer keeps
+     * its cached snapshot, and then the registry decides whether it is on.
      *
      * When nothing collides, the sender is marked as being switched on in
      * the same synchronous step as the check, so a sibling checked a moment
      * later in the same take sees it. The caller must releaseActivation()
-     * once the activation is through, successful or not.
+     * once the activation is through, successful or not; a claim that is
+     * never released expires after CLAIM_TTL_MS.
      */
     async claimActivation(senderId:string): Promise<ReturnType<NmosRegistryConnector["findMulticastConflict"]>> {
+        let fresh = new Set<string>();
         let readOne = async (id:string) => {
             try{
                 let s = this.nmosState.senders[id];
-                if(s){ await this.readSenderActive(id, this.nmosState.devices[s.device_id]); }
+                if(s){ await this.readSenderActive(id, this.nmosState.devices[s.device_id], fresh); }
             }catch(e){}
         };
         await readOne(senderId);
@@ -1886,14 +1935,23 @@ export class NmosRegistryConnector {
             if(otherId === senderId){ continue; }
             let tps = (this.nmosState as any).senderActiveData?.[otherId]?.transport_params;
             if(!Array.isArray(tps)){ continue; }
-            if(ours.some((l) => tps[l.index] && tps[l.index].destination_ip === l.ip)){
+            // Same group, and the same port where both are known: a factory
+            // default group many units share must not cost a request per
+            // unit on every activation. (A port changed on the device itself
+            // without an IS-04 event is the one thing this does not see.)
+            if(ours.some((l) => {
+                let tp = tps[l.index];
+                if(!tp || tp.destination_ip !== l.ip){ return false; }
+                let port = NmosRegistryConnector.portOf(tp);
+                return l.port === null || port === null || port === l.port;
+            })){
                 sharing.push(otherId);
             }
         }
         await Promise.all(sharing.map(readOne));
-        let conflict = this.findMulticastConflict(senderId);
+        let conflict = this.findMulticastConflict(senderId, fresh);
         if(!conflict){
-            this.pendingActivations.add(senderId);
+            this.pendingActivations.set(senderId, Date.now());
         }
         return conflict;
     }
@@ -1949,7 +2007,10 @@ export class NmosRegistryConnector {
         //}else{
             // Load manifest
             try{
-                let sdp = await axios.get(sender.manifest_href)
+                // Bounded: an auto-activation holds its claim until this
+                // returns, and a device that accepts the connection but
+                // never answers must not keep it forever.
+                let sdp = await axios.get(sender.manifest_href, {timeout:10000})
                 info.manifestFile = sdp.data;
             }catch(e){
                 info.error = "Can not load Manifest from sender: " + e.code;

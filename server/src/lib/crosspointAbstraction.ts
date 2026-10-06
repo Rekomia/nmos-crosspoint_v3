@@ -615,7 +615,20 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
 
                         let usedSources = [];
 
-                        for(let dstFlow of dstFlows){
+                        // Live flows first, on both sides. An unavailable
+                        // sender (vanished, or registered without its flow /
+                        // source record) and an unavailable receiver (gone
+                        // from the registry) can't be connected, and must not
+                        // take a pairing away from a live flow — nor keep a
+                        // device cell from ever reading as switched. They are
+                        // still paired when nothing live is left, so a take on
+                        // them fails as before instead of turning into a
+                        // disconnect. (Mirrored in the UI preview,
+                        // crosspoint.svelte computePreviewConnections.)
+                        let liveFirst = (flows:any[]) => flows.filter((f) => f.available !== false).concat(flows.filter((f) => f.available === false));
+                        let rank = (f:any) => (f.available === false ? 1 : 0);
+
+                        for(let dstFlow of liveFirst(dstFlows)){
                             let connection = {src:null,srcDev:srcDev, dst:dstFlow,dstDev:dstDev}
 
                             if(disconnect){
@@ -641,22 +654,12 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                                         }
                                     }
 
-                                    // A vanished sender (kept in the shadow
-                                    // with available:false) can't be
-                                    // connected — every take on it fails. It
-                                    // must not take a receiver from a live
-                                    // flow, nor keep a device cell from ever
-                                    // reading as switched. (Mirrored in the
-                                    // UI preview, crosspoint.svelte.)
-                                    if(srcFlow.available === false){
-                                        connect = false;
-                                    }
-
                                     if(connect && !usedSources.includes(srcFlow.id)){
                                         if(connection.src == null){
                                             connection.src = srcFlow;
                                             usedSources.push(srcFlow.id);
-                                        }else if(connection.src.num > srcFlow.num){
+                                        }else if(rank(srcFlow) < rank(connection.src) ||
+                                                 (rank(srcFlow) === rank(connection.src) && connection.src.num > srcFlow.num)){
                                             // usedSources holds ids. This used
                                             // to compare `s.id`, so the earlier
                                             // pick stayed taken and the
@@ -753,7 +756,24 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
     }
 
 
+    // The take running or queued per receiver. Takes on one receiver run one
+    // after another, in the order they were asked for: a disconnect needs no
+    // sender information and would otherwise overtake a connect still busy
+    // fetching an SDP or activating its sender — a quick second click meant
+    // as OFF ended up with the receiver connected.
+    private receiverTakes: Map<string, Promise<any>> = new Map();
+
     executeConnection(src:CrosspointFlow,dst:CrosspointFlow){
+        if(!dst){ return this.executeConnectionNow(src, dst); }
+        let previous = this.receiverTakes.get(dst.id) || Promise.resolve();
+        let run = previous.catch(()=>{}).then(() => this.executeConnectionNow(src, dst));
+        let tail = run.catch(()=>{});
+        this.receiverTakes.set(dst.id, tail);
+        tail.then(() => { if(this.receiverTakes.get(dst.id) === tail){ this.receiverTakes.delete(dst.id); } });
+        return run;
+    }
+
+    private executeConnectionNow(src:CrosspointFlow,dst:CrosspointFlow){
         return new Promise(async(resolve, reject) => {
             if(dst){
                 let senderInfo:CrosspointConnectionSenderInfo|null = null;
