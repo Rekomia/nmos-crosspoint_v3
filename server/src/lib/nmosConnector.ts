@@ -1745,7 +1745,13 @@ export class NmosRegistryConnector {
      * running sender, rtp_enabled off. Unused legs often keep a factory
      * default group that every unit of a model shares (239.255.66.113 on
      * each Blackmagic audio sender's second leg). Our own rtp_enabled does
-     * not count: activating the sender switches every leg on.
+     * not count: activating the sender switches every leg on. Nor does our
+     * own 0.0.0.0 when EVERY leg shows it — a device may only resolve its
+     * source addresses once it is switched on, and then nothing at all
+     * would be checked.
+     *
+     * Works on the cached IS-05 snapshots; findMulticastConflictFresh
+     * re-reads the devices before a refusal.
      */
     findMulticastConflict(senderId:string): { id:string, label:string, leg:number, multicast:string, port:number|null } | null {
         try{
@@ -1758,12 +1764,16 @@ export class NmosRegistryConnector {
                 NmosRegistryConnector.silentSenderLegs(sender, active, active.transport_params.length).map((l) => l.index);
             // Build the list of streams we want to claim, per leg index.
             let ourSilent = silentOf(this.nmosState.senders[senderId], activeData);
-            let ourLegs: Array<{ index:number, ip:string, port:number|null }> = [];
+            let candidates: Array<{ index:number, ip:string, port:number|null }> = [];
             activeData.transport_params.forEach((tp:any, index:number)=>{
-                if(tp && typeof tp.destination_ip === "string" && tp.destination_ip && !ourSilent.includes(index)){
-                    ourLegs.push({ index, ip: tp.destination_ip, port: portOf(tp) });
+                if(tp && typeof tp.destination_ip === "string" && tp.destination_ip){
+                    candidates.push({ index, ip: tp.destination_ip, port: portOf(tp) });
                 }
             });
+            let ourLegs = candidates.filter((l) => !ourSilent.includes(l.index));
+            if(ourLegs.length === 0){
+                ourLegs = candidates;
+            }
             if(ourLegs.length === 0){
                 return null;
             }
@@ -1776,6 +1786,11 @@ export class NmosRegistryConnector {
                 }
                 let otherActive:any = (this.nmosState as any).senderActiveData?.[otherId];
                 if(!otherActive || !Array.isArray(otherActive.transport_params)){
+                    continue;
+                }
+                // IS-04 says active, the device's own IS-05 says off: the
+                // registry is behind, nothing is on the wire.
+                if(otherActive.master_enable === false){
                     continue;
                 }
                 let otherSilent = silentOf(other, otherActive);
@@ -1801,15 +1816,47 @@ export class NmosRegistryConnector {
                     }catch(e){}
                     // Devices that give every sender the device's name (as
                     // Blackmagic does) only tell them apart in the
-                    // description — "…: Audio".
+                    // description — "…: Audio" — or else by the format.
                     if(typeof other.description === "string" && other.description && !label.includes(other.description)){
                         label += " (" + other.description + ")";
+                    }else{
+                        let format = "" + (this.nmosState.flows?.[other.flow_id]?.format || "");
+                        if(format){ label += " (" + format.split(":").pop() + ")"; }
                     }
                     return { id: otherId, label, leg: leg.index, multicast: leg.ip, port: leg.port ?? otherPort };
                 }
             }
         }catch(e){}
         return null;
+    }
+
+
+    /**
+     * findMulticastConflict on the devices' current state. The snapshots
+     * only move with IS-04 events, and a change made on the device itself
+     * (a multicast, a leg switched off) need not produce one. Our own sender
+     * is re-read before the check; every sender it collides with is re-read
+     * and checked again, so a refusal never rests on a stale cache. A device
+     * that does not answer keeps its cached snapshot.
+     */
+    async findMulticastConflictFresh(senderId:string): Promise<ReturnType<NmosRegistryConnector["findMulticastConflict"]>> {
+        let readOne = async (id:string) => {
+            try{
+                let s = this.nmosState.senders[id];
+                if(s){ await this.readSenderActive(id, this.nmosState.devices[s.device_id]); }
+            }catch(e){}
+        };
+        await readOne(senderId);
+        let conflict = this.findMulticastConflict(senderId);
+        // The re-read one may turn out clear and the next match be another
+        // sender — each one gets its own fresh look before it counts.
+        let reread = new Set<string>();
+        while(conflict && !reread.has(conflict.id)){
+            reread.add(conflict.id);
+            await readOne(conflict.id);
+            conflict = this.findMulticastConflict(senderId);
+        }
+        return conflict;
     }
 
 

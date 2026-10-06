@@ -900,11 +900,14 @@
             // devices with different flow counts look "not switched", so the
             // second click took the same connections again (each one dropped
             // and re-patched) instead of switching them off. The OFF click
-            // likewise only parts what this device pair connected.
-            let pairs = newList.filter((n:any)=> n.src && n.dst);
+            // likewise only parts what this device pair connected. An offline
+            // receiver can never show a connection, so it does not get a say.
+            let pairs = newList.filter((n:any)=> n.src && n.dst && n.dst.available !== false);
             let allActive = pairs.length > 0 && pairs.every((n:any)=>{
-              let live = findReceiverFlowById(n.dst.id);
-              return !!live && live.connectedFlow === n.src.id;
+              // A flow hidden by the view filter is not in `receivers`; the
+              // response carries the server's own copy of it.
+              let live = findReceiverFlowById(n.dst.id) || n.dst;
+              return live.connectedFlow === n.src.id;
             });
             if(allActive){
               cleanPreparedConnections(pairs.map((n:any)=>({ srcDev: null, src: null, dstDev: n.dstDev, dst: n.dst })));
@@ -1146,9 +1149,11 @@
                   picked = srcFlow;
                   usedSources.push(srcFlow.id);
                 }else if(picked.num > srcFlow.num){
-                  // Server behaviour: the earlier pick's id stays in
-                  // usedSources and the replacement's id is not added.
+                  // Same as the server: the earlier pick is free again,
+                  // the replacement is taken.
+                  usedSources = usedSources.filter((id:any)=> id !== picked.id);
                   picked = srcFlow;
+                  usedSources.push(srcFlow.id);
                 }
               }
             }

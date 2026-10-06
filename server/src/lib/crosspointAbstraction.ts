@@ -646,14 +646,17 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                                             connection.src = srcFlow;
                                             usedSources.push(srcFlow.id);
                                         }else if(connection.src.num > srcFlow.num){
-                                            usedSources = usedSources.filter((s)=>{
-                                                if(s.id == connection.src.id){
-                                                    return false;
-                                                }else{
-                                                    return true;
-                                                }
-                                            })
+                                            // usedSources holds ids. This used
+                                            // to compare `s.id`, so the earlier
+                                            // pick stayed taken and the
+                                            // replacement was never marked —
+                                            // with flow numbers out of array
+                                            // order one sender went to two
+                                            // receivers. (The UI preview in
+                                            // crosspoint.svelte mirrors this.)
+                                            usedSources = usedSources.filter((id)=> id !== connection.src.id);
                                             connection.src = srcFlow;
+                                            usedSources.push(srcFlow.id);
                                         }
                                     }
                                 
@@ -786,7 +789,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                 let autoActivate = !!(this.settings && this.settings.autoActivateInactiveSender);
                 if(autoActivate && src && src.id.startsWith("nmos_") && senderInfo && senderInfo.active === false){
                     let nmosId = src.id.slice(5);
-                    let conflict = NmosRegistryConnector.instance.findMulticastConflict(nmosId);
+                    let conflict = await NmosRegistryConnector.instance.findMulticastConflictFresh(nmosId);
                     if(conflict){
                         let msg = "Multicast " + conflict.multicast + (conflict.port !== null ? ":" + conflict.port : "") +
                                   " (Leg " + (conflict.leg + 1) + ") is already in use by sender: " +
