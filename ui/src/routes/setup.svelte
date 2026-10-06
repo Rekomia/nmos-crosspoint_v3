@@ -47,6 +47,7 @@
       multicastRange: string;
       autoMulticast: { enabled: boolean, reconnectReceiversOnSenderChange?: boolean };
       autoActivateInactiveSender: boolean;
+      primaryLegOnly: boolean;
       audioMonitor: { enabled: boolean };
       bcp008: { enabled: boolean };
       // pool = the single-range counter; per-cat fields kept for back-compat
@@ -66,6 +67,7 @@
       multicastRange: "",
       autoMulticast: { enabled: false, reconnectReceiversOnSenderChange: false },
       autoActivateInactiveSender: false,
+      primaryLegOnly: false,
       audioMonitor: { enabled: false },
       bcp008: { enabled: true },
       multicastStats: { pool:{used:0,total:0} },
@@ -84,6 +86,7 @@
     let formAutoMulticastEnabled:boolean = false;
     let formReconnectReceivers:boolean = false;
     let formAutoActivateSender:boolean = false;
+    let formPrimaryLegOnly:boolean = false;
     let formAudioMonitorEnabled:boolean = false;
     let formBcp008Enabled:boolean = true;
     let formDnssdEnabled:boolean = true;
@@ -203,6 +206,7 @@
               obj.autoMulticast.reconnectReceiversOnMulticastChange
             ));
             formAutoActivateSender   = !!obj.autoActivateInactiveSender;
+            formPrimaryLegOnly       = !!obj.primaryLegOnly;
             formAudioMonitorEnabled  = !!(obj.audioMonitor && obj.audioMonitor.enabled);
             formBcp008Enabled        = !(obj.bcp008 && obj.bcp008.enabled === false);
             formDnssdEnabled         = !(obj.registryDiscovery && obj.registryDiscovery.unicastDnssd === false);
@@ -299,6 +303,7 @@
         (serverState.autoMulticast as any).reconnectReceiversOnMulticastChange
       ));
       formAutoActivateSender   = !!serverState.autoActivateInactiveSender;
+      formPrimaryLegOnly       = !!serverState.primaryLegOnly;
       formAudioMonitorEnabled  = !!(serverState.audioMonitor && serverState.audioMonitor.enabled);
       formBcp008Enabled        = !(serverState.bcp008 && serverState.bcp008.enabled === false);
       formDnssdEnabled         = !((serverState as any).registryDiscovery && (serverState as any).registryDiscovery.unicastDnssd === false);
@@ -378,6 +383,7 @@
           reconnectReceiversOnSenderChange: formReconnectReceivers
         },
         autoActivateInactiveSender: formAutoActivateSender,
+        primaryLegOnly: formPrimaryLegOnly,
         audioMonitor: { enabled: formAudioMonitorEnabled },
         bcp008: { enabled: formBcp008Enabled },
         registryDiscovery: { unicastDnssd: formDnssdEnabled, domain: formDnssdDomain.trim() },
@@ -982,6 +988,31 @@
         <label class="label cursor-pointer gap-3" style="justify-content:flex-start;">
           <span class="label-text">Auto-activate inactive sender on Crosspoint connect</span>
           <input type="checkbox" class="toggle" bind:checked={formAutoActivateSender} on:change={markDirty} />
+        </label>
+      </div>
+    </section>
+
+
+    <section class="setup-section">
+      <h3>ST 2022-7: Primary Leg Only</h3>
+      <p class="setup-section-hint">
+        Connect receivers on the <em>primary</em> leg only. Every further leg
+        goes to the receiver with rtp_enabled&nbsp;=&nbsp;false and is left out
+        of the SDP it gets. For plants that run without redundancy while
+        their devices still publish a second leg, often with factory-default
+        multicasts that several senders share and that a receiver refuses
+        once it holds one of them on another input. Off by default: a
+        redundant plant needs both legs. Applies from the next connection
+        on; existing connections stay as they are until they are switched
+        again. With this off, a second leg is still left out whenever the
+        sender itself shows it is not transmitting on it (no interface
+        bound, rtp_enabled&nbsp;=&nbsp;false, or source address 0.0.0.0).
+      </p>
+
+      <div class="setup-form">
+        <label class="label cursor-pointer gap-3" style="justify-content:flex-start;">
+          <span class="label-text">Connect receivers on the primary leg only</span>
+          <input type="checkbox" class="toggle" bind:checked={formPrimaryLegOnly} on:change={markDirty} />
         </label>
       </div>
     </section>

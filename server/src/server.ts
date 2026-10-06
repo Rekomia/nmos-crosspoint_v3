@@ -401,6 +401,7 @@ function getSetupConfigState() {
         reconnectReceiversOnSenderChange: !!settings.reconnectReceiversOnSenderChange
     };
     let autoActivateInactiveSender = !!settings.autoActivateInactiveSender;
+    let primaryLegOnly = !!settings.primaryLegOnly;
     let multicastStats = (MulticastLeaseManager.instance
         ? MulticastLeaseManager.instance.getStats()
         : { pool:{used:0,total:0}, audio:{used:0,total:0}, video:{used:0,total:0} });
@@ -485,6 +486,7 @@ function getSetupConfigState() {
         multicastRange,
         autoMulticast,
         autoActivateInactiveSender,
+        primaryLegOnly,
         multicastStats,
         ddns,
         auth: { users: authUsers },
@@ -698,6 +700,9 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                 }
                 if(typeof postData.autoActivateInactiveSender === "boolean"){
                     next.autoActivateInactiveSender = postData.autoActivateInactiveSender;
+                }
+                if(typeof postData.primaryLegOnly === "boolean"){
+                    next.primaryLegOnly = postData.primaryLegOnly;
                 }
                 if(postData.ddns && typeof postData.ddns === "object"){
                     let d = postData.ddns;
@@ -920,6 +925,9 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
             settings.autoMulticast = { enabled: !!next.autoMulticast.enabled };
             settings.reconnectReceiversOnSenderChange = !!next.autoMulticast.reconnectReceiversOnSenderChange;
             settings.autoActivateInactiveSender = !!next.autoActivateInactiveSender;
+            // Read by makeConnection on every take — applies from the next
+            // one on, existing connections stay as they are.
+            settings.primaryLegOnly = !!next.primaryLegOnly;
 
             // Audio monitor toggle. When the operator just turned the feature
             // OFF, tear down any active producers immediately — don't wait

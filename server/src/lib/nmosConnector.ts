@@ -1829,8 +1829,9 @@ export class NmosRegistryConnector {
         info.interfaces = NmosRegistryConnector.bindingInterfaces(sender, node);
 
         // Which of the SDP's legs the sender actually transmits on. Read
-        // fresh, like the manifest: it is the device's state right now.
-        if(typeof info.manifestFile === "string"){
+        // fresh, like the manifest: it is the device's state right now. With
+        // "primary leg only" set the answer changes nothing, so don't ask.
+        if(typeof info.manifestFile === "string" && !this.settings?.primaryLegOnly){
             let sdpLegCount = (info.manifestFile.match(/^m=/gm) || []).length;
             if(sdpLegCount > 1){
                 let senderActive = await this.readSenderActive(senderId, device);
@@ -1936,15 +1937,25 @@ export class NmosRegistryConnector {
         // Legs the sender lists but does not transmit on stay off on the
         // receiver. Never every leg: if nothing would be left, the sender's
         // statements contradict its own SDP, and the SDP decides as before.
+        let primaryLegOnly = !!this.settings?.primaryLegOnly;
         let silentLegs = (senderInfo.silentLegs || []).filter((l) => l.index < sdpLegs.length && sdpLegs[l.index].multicast_ip);
+        if(primaryLegOnly){
+            // Setup says the plant runs on the primary leg only: every leg
+            // after the first stays off whatever the sender says about it,
+            // and the primary is never the one switched off.
+            silentLegs = sdpLegs.map((l, i) => i).filter((i) => i > 0 && sdpLegs[i].multicast_ip)
+                .map((i) => ({ index:i, reason:"\"Primary leg only\" is on in Setup" }));
+        }
         let liveLegs = sdpLegs.map((l, i) => i).filter((i) => sdpLegs[i].multicast_ip && !silentLegs.some((l) => l.index === i));
         if(liveLegs.length === 0){
             silentLegs = [];
         }
         if(silentLegs.length > 0){
-            SyncLog.log("info", "NMOS Connect", "Receiver " + receiverId + ": " +
+            // Under the switch this is every take, and expected — keep it
+            // out of the default log view.
+            SyncLog.log(primaryLegOnly ? "verbose" : "info", "NMOS Connect", "Receiver " + receiverId + ": " +
                 silentLegs.map((l) => "leg " + (l.index + 1) + " of the sender's SDP left off (" + l.reason + ")").join("; ") +
-                " — the receiver joins only the leg(s) the sender transmits.");
+                (primaryLegOnly ? " — the receiver joins the primary leg only." : " — the receiver joins only the leg(s) the sender transmits."));
         }
 
         // The IS-05 control endpoints of the receiver's device. Resolved here
