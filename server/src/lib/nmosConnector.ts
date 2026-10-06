@@ -531,6 +531,105 @@ export class NmosRegistryConnector {
         return null;
     }
 
+    /**
+     * A sender's IS-05 active parameters, read straight from the device and
+     * written back into the cache. The cached snapshot only moves when IS-04
+     * reports a change, and switching a leg on or off need not touch IS-04.
+     * Falls back to the cache when no control endpoint answers.
+     */
+    private async readSenderActive(senderId:string, device:any):Promise<any|null>{
+        let preferred = ["urn:x-nmos:control:sr-ctrl/v1.1", "urn:x-nmos:control:sr-ctrl/v1.0"];
+        for(let ctrlType of preferred){
+            for(let c of NmosRegistryConnector.controlsOf(device)){
+                if(!c || c.type !== ctrlType){ continue; }
+                let href:string = c.href;
+                if(href[href.length-1] !== "/"){ href += "/"; }
+                href += "single/senders/" + senderId + "/active/";
+                try{
+                    const response = await axios.get(href, {timeout:5000});
+                    if(response && response.data){
+                        this.nmosState.senderActiveData[senderId] = response.data;
+                        return response.data;
+                    }
+                }catch(e){}
+            }
+        }
+        return (this.nmosState as any).senderActiveData?.[senderId] || null;
+    }
+
+    /**
+     * The legs a sender lists in its SDP but does not transmit on.
+     *
+     * A sender may publish both ST 2022-7 media blocks while only the first
+     * one is in use. The second then carries the device's factory defaults —
+     * a multicast that every unit of that model shares, a placeholder source
+     * address. Taken at face value it gets enabled on the receiver as well,
+     * and a receiver that already joined the same default group on another
+     * input refuses the whole PATCH ("cannot have differing redundant
+     * information"), primary leg included.
+     *
+     * The sender says itself which legs are real, in two places:
+     *  - IS-04 interface_bindings names one interface per leg in use. A leg
+     *    past the end of that list is not wired to anything. Only v1.2+
+     *    resources have the field; without it nothing is ruled out.
+     *  - IS-05 /active has rtp_enabled per leg. That only counts while the
+     *    sender as a whole is on: deactivating a sender switches every leg
+     *    off, and a receiver routed to it now must still join all of them
+     *    once it comes back.
+     */
+    private static silentSenderLegs(sender:any, active:any, sdpLegCount:number):Array<{ index:number, reason:string }>{
+        let out:Array<{ index:number, reason:string }> = [];
+        let bindings = (sender && Array.isArray(sender.interface_bindings)) ? sender.interface_bindings : [];
+        let params = (active && active.master_enable === true && Array.isArray(active.transport_params)) ? active.transport_params : [];
+        for(let i = 0; i < sdpLegCount; i++){
+            if(bindings.length > 0 && i >= bindings.length){
+                out.push({ index:i, reason:"the sender binds " + bindings.length + " interface(s) in IS-04, none for this leg" });
+            }else if(params[i] && params[i].rtp_enabled === false){
+                out.push({ index:i, reason:"rtp_enabled is false on this leg of the active sender" });
+            }
+        }
+        return out;
+    }
+
+    /**
+     * The SDP without the media blocks at the given positions. Their mids are
+     * taken out of any a=group line, and a group left with fewer than two
+     * members goes entirely — a DUP group naming a stream that is not in the
+     * file is no longer a valid ST 2022-7 description. Line-based on purpose:
+     * every other line stays exactly what the sender published.
+     */
+    private static dropSdpMedia(sdp:string, indices:number[]):string{
+        let eol = sdp.includes("\r\n") ? "\r\n" : "\n";
+        // The final line break belongs to the file, not to whichever media
+        // block happens to be last — RFC 4566 ends every line with one.
+        let trailing = /\r?\n$/.test(sdp);
+        let kept:string[] = [];
+        let droppedMids:string[] = [];
+        let media = -1;
+        for(let line of sdp.replace(/\r?\n$/, "").split(/\r?\n/)){
+            if(line.startsWith("m=")){ media++; }
+            if(media >= 0 && indices.includes(media)){
+                let mid = /^a=mid:(\S+)/.exec(line);
+                if(mid){ droppedMids.push(mid[1]); }
+                continue;
+            }
+            kept.push(line);
+        }
+        let out:string[] = [];
+        for(let line of kept){
+            if(line.startsWith("a=group:")){
+                let parts = line.trim().split(/\s+/);
+                let members = parts.slice(1).filter((m) => !droppedMids.includes(m));
+                if(members.length < parts.length - 1){
+                    if(members.length < 2){ continue; }
+                    line = [parts[0], ...members].join(" ");
+                }
+            }
+            out.push(line);
+        }
+        return out.join(eol) + (trailing ? eol : "");
+    }
+
     /** Rank of an "vX.Y" API version string, -1 when it doesn't parse. */
     private static versionRank(version:string):number{
         let m = /^v(\d+)\.(\d+)$/.exec("" + version);
@@ -1720,6 +1819,16 @@ export class NmosRegistryConnector {
 
         info.interfaces = NmosRegistryConnector.bindingInterfaces(sender, node);
 
+        // Which of the SDP's legs the sender actually transmits on. Read
+        // fresh, like the manifest: it is the device's state right now.
+        if(typeof info.manifestFile === "string"){
+            let sdpLegCount = (info.manifestFile.match(/^m=/gm) || []).length;
+            if(sdpLegCount > 1){
+                let senderActive = await this.readSenderActive(senderId, device);
+                info.silentLegs = NmosRegistryConnector.silentSenderLegs(sender, senderActive, sdpLegCount);
+            }
+        }
+
         if(sender.transport == "urn:x-nmos:transport:rtp.mcast"){
             info.transport = "rtp.mcast"
         }
@@ -1815,6 +1924,20 @@ export class NmosRegistryConnector {
             }
         }
 
+        // Legs the sender lists but does not transmit on stay off on the
+        // receiver. Never every leg: if nothing would be left, the sender's
+        // statements contradict its own SDP, and the SDP decides as before.
+        let silentLegs = (senderInfo.silentLegs || []).filter((l) => l.index < sdpLegs.length && sdpLegs[l.index].multicast_ip);
+        let liveLegs = sdpLegs.map((l, i) => i).filter((i) => sdpLegs[i].multicast_ip && !silentLegs.some((l) => l.index === i));
+        if(liveLegs.length === 0){
+            silentLegs = [];
+        }
+        if(silentLegs.length > 0){
+            SyncLog.log("info", "NMOS Connect", "Receiver " + receiverId + ": " +
+                silentLegs.map((l) => "leg " + (l.index + 1) + " of the sender's SDP left off (" + l.reason + ")").join("; ") +
+                " — the receiver joins only the leg(s) the sender transmits.");
+        }
+
         // The IS-05 control endpoints of the receiver's device. Resolved here
         // rather than just before the PATCH because the number of legs has to
         // be read from the device before transport_params can be built.
@@ -1857,7 +1980,7 @@ export class NmosRegistryConnector {
                 // explicitly disabled — leaving them as `{rtp_enabled:true,
                 // interface_ip:"auto"}` makes strict receivers reject the
                 // whole PATCH because there's no media to bind to.
-                if(i < sdpLegs.length && sdpLegs[i].multicast_ip){
+                if(i < sdpLegs.length && sdpLegs[i].multicast_ip && !silentLegs.some((l) => l.index === i)){
                     let leg:any = {
                         multicast_ip:     sdpLegs[i].multicast_ip,
                         destination_port: sdpLegs[i].destination_port,
@@ -1883,6 +2006,16 @@ export class NmosRegistryConnector {
             if(this.settings.fixSdpBugs){
                 manifest = manifest.replace("colorimetry=UNSPECIFIED;", "colorimetry=BT709;");
                 manifest = manifest.replace("TCS=UNSPECIFIED;", "TCS=SDR;");
+            }
+
+            // The file loses the legs left off as well, so that it describes
+            // the same stream as transport_params — a receiver may read the
+            // redundancy pairing from the file's DUP group. Only legs behind
+            // every live one: the receiver maps the file's streams onto its
+            // legs by position, and a gap at the front would shift them.
+            let trailingSilent = silentLegs.map((l) => l.index).filter((i) => i > Math.max(...liveLegs));
+            if(manifest && trailingSilent.length > 0){
+                manifest = NmosRegistryConnector.dropSdpMedia(manifest, trailingSilent);
             }
 
             // An empty manifest is not a transport file, it is a PATCH the

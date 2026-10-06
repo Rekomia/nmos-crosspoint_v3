@@ -1929,7 +1929,10 @@ export interface CrosspointConnectionSenderInfo {
     interfaces:any[],
     active:boolean,
     error:string,
-    transport:string
+    transport:string,
+    // Legs the sender lists in its SDP but does not transmit on, by index,
+    // with the sender's own statement that rules each one out.
+    silentLegs?:Array<{ index:number, reason:string }>
 }
 
 export interface CrosspointShadowDevice {
