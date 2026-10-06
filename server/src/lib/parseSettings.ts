@@ -150,6 +150,18 @@ export function parseSettings(settings:any){
     }
 
 
+    // ST 2022-7: connect receivers on the primary leg only. For plants that
+    // run without redundancy while their devices still publish a second leg
+    // in every SDP — often with factory-default multicasts that several
+    // senders share, which a receiver holding one of them on another input
+    // refuses. Every leg after the first then goes to the receiver as
+    // rtp_enabled:false and is left out of the transport file. Defaults to
+    // FALSE: a redundant plant needs both legs.
+    if(typeof settings.primaryLegOnly !== "boolean"){
+        settings.primaryLegOnly = false;
+    }
+
+
     // Vendor profiles — define how to build the "open device web UI" link
     // for each manufacturer. A device is matched against profiles in order;
     // the first profile whose labels list contains a substring of the node's

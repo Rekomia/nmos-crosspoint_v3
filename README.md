@@ -60,6 +60,9 @@ Auto-Activate Sender, off by default, automatically switches on an inactive send
 
 ![Setup: auto-activate + multicast DHCP](Screenshots/setup-multicast-dhcp.png)
 
+**ST 2022-7: Primary Leg Only**
+Off by default. When on, receivers are connected on the primary leg only: every further leg goes to the receiver with `rtp_enabled: false` and is left out of the SDP it gets. Meant for plants that run without redundancy while their devices still publish a second leg — often with factory-default multicasts that several senders share, which a receiver refuses once it holds one of them on another input. Applies from the next connection on. With it off, a second leg is still left out whenever the sender itself shows it is not transmitting on it: no interface bound in IS-04, `rtp_enabled: false` on an active sender, or source address `0.0.0.0` in IS-05.
+
 **Lease Inventory**
 Every multicast allocation is listed with live status (active / inactive / missing), category badge (audio / video), bitrate and allocation date. One-click release per row, or "Release all leases" to start fresh. The list can also be exported and imported as JSON.
 
