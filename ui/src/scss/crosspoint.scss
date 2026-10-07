@@ -1327,9 +1327,12 @@ $cp-border: 1px solid transparent;
                 // Partially routed: half filled, ring in the same colour —
                 // the empty half is what a click would still connect. Keeps
                 // the health colour (--cp-dot) and stays apart from the
-                // dashed staged / grey working looks.
+                // dashed staged / grey working looks. Anchored to the border
+                // box: on hover the dot gains a dashed border, and a
+                // padding-box gradient would tile into it and paint the edge
+                // of the empty half.
                 &.active.cp-partial {
-                    background: linear-gradient(90deg, var(--cp-dot) 50%, transparent 50%);
+                    background: linear-gradient(90deg, var(--cp-dot) 50%, transparent 50%) border-box;
                     box-shadow: inset 0 0 0 2px var(--cp-dot);
                 }
 
@@ -1550,7 +1553,7 @@ html[data-theme="light"] {
                     // theme-scoped `span.active` above out-ranks the default
                     // block and would fill the empty half green.
                     &.active.cp-partial {
-                        background: linear-gradient(90deg, var(--cp-dot) 50%, transparent 50%);
+                        background: linear-gradient(90deg, var(--cp-dot) 50%, transparent 50%) border-box;
                         box-shadow: inset 0 0 0 2px var(--cp-dot);
                     }
                 }
