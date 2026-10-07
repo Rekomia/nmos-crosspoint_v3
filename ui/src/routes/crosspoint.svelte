@@ -1081,6 +1081,28 @@
       return list.filter((n:any)=> n.dst && n.dst.available !== false && srcIds.has(effectiveConnectedFlow(n.dst)));
     }
 
+    // id -> {flow, dev} over the WHOLE state, hidden and filtered flows
+    // included, to turn the matcher's id pairs back into flows.
+    function stateFlowIndex(){
+      const idx = { senders: new Map<string,{flow:any,dev:any}>(), receivers: new Map<string,{flow:any,dev:any}>() };
+      const devs:any[] = (sourceState && Array.isArray(sourceState.devices)) ? sourceState.devices : [];
+      for(const d of devs){
+        for(const t in (d.senders || {})){ for(const f of (d.senders[t] || [])){ idx.senders.set(f.id, { flow: f, dev: d }); } }
+        for(const t in (d.receivers || {})){ for(const f of (d.receivers[t] || [])){ idx.receivers.set(f.id, { flow: f, dev: d }); } }
+      }
+      return idx;
+    }
+
+    // The matcher's {src, dst} id pairs (computePreviewConnections) as
+    // flow objects — the shape cellOffTargets reads.
+    function pairsAsFlows(list:any[], idx:ReturnType<typeof stateFlowIndex>):any[]{
+      return list.map((e:any)=>{
+        let s = e.src ? idx.senders.get(e.src) : null;
+        let r = idx.receivers.get(e.dst);
+        return { src: s ? s.flow : null, dst: r ? r.flow : null, dstDev: r ? r.dev : null };
+      });
+    }
+
     function findReceiverFlowById(id:string):any{
       for(const d of receivers){
         for(const t of flowTypes){
@@ -1108,21 +1130,7 @@
 
       let next = computePreviewConnections(srcString, dstString);
       // A click on a switched cell turns it OFF — preview exactly that.
-      let flowIn = (kind:string, id:string)=>{
-        let devs:any[] = (sourceState && Array.isArray(sourceState.devices)) ? sourceState.devices : [];
-        for(const d of devs){
-          for(const t in (d[kind] || {})){
-            for(const f of (d[kind][t] || [])){ if(f.id === id){ return { dev: d, flow: f }; } }
-          }
-        }
-        return null;
-      };
-      let asObjects = next.map((e:any)=>{
-        let s = e.src ? flowIn("senders", e.src) : null;
-        let r = flowIn("receivers", e.dst);
-        return { src: s ? s.flow : null, dst: r ? r.flow : null, dstDev: r ? r.dev : null };
-      });
-      let off = cellOffTargets(asObjects, sourceIdsOf(srcDev, src));
+      let off = cellOffTargets(pairsAsFlows(next, stateFlowIndex()), sourceIdsOf(srcDev, src));
       if(off){ next = off.map((n:any)=>({ src: null, dst: n.dst.id })); }
       // Same preview as before (hovering along the same row/column) — skip
       // the full matrix repaint entirely. Element-wise compare instead of
@@ -1350,7 +1358,7 @@
       // EVERY active connection between the two devices is staged for
       // disconnect; health = solid fill in the WORST status of any
       // connection between the two devices (red beats orange beats green).
-      const devAgg: Map<string,{anyUnstaged:boolean,sawPrepared:boolean,sawWorking:boolean,healths:number[],sawUnmon:boolean}> = new Map();
+      const devAgg: Map<string,{anyUnstaged:boolean,sawPrepared:boolean,sawWorking:boolean,healths:number[],sawUnmon:boolean,sDev:any,rDev:any}> = new Map();
 
       // 1) ACTIVE connections — walk the receivers once.
       for(const [rid, rE] of receiverByFlowId){
@@ -1373,17 +1381,31 @@
 
         const k = sE.dev.id + "|" + rE.dev.id;
         let a = devAgg.get(k);
-        if(!a){ a = {anyUnstaged:false, sawPrepared:false, sawWorking:false, healths:[], sawUnmon:false}; devAgg.set(k, a); }
+        if(!a){ a = {anyUnstaged:false, sawPrepared:false, sawWorking:false, healths:[], sawUnmon:false, sDev:sE.dev, rDev:rE.dev}; devAgg.set(k, a); }
         a.healths.push(h);
         if(unmon){ a.sawUnmon = true; }
         if(discPrepared.has(rid)){ a.sawPrepared = true; }
         else if(discWorking.has(rid)){ a.sawWorking = true; }
         else { a.anyUnstaged = true; }
       }
+      // Partially routed: some connection runs between the two devices, but
+      // not every pair a click on the cell would make. The dot then looks
+      // half filled — and a click CONNECTS the rest instead of switching
+      // off (same decision as the click itself, cellOffTargets). Folded
+      // node cells stand for many devices and only unfold on a click, so
+      // they keep the plain look. The index is built only when needed.
+      let stateIdx: ReturnType<typeof stateFlowIndex> | null = null;
       for(const [k, a] of devAgg){
         let cls = "active";
-        if(!a.anyUnstaged && (a.sawPrepared || a.sawWorking)){
+        let staged = !a.anyUnstaged && (a.sawPrepared || a.sawWorking);
+        if(staged){
           cls += a.sawPrepared ? " cp-disc-prepared" : " cp-disc-working";
+        }else if(!a.sDev?.isNode && !a.rDev?.isNode){
+          if(!stateIdx){ stateIdx = stateFlowIndex(); }
+          let list = computePreviewConnections(getDevcieNameString(a.sDev, null), getDevcieNameString(a.rDev, null));
+          if(cellOffTargets(pairsAsFlows(list, stateIdx), sourceIdsOf(a.sDev, null)) === null){
+            cls += " cp-partial";
+          }
         }
         // Worst status wins and FILLS the dot: one unhealthy connection
         // among many healthy ones must be as loud as a uniformly bad pair.
