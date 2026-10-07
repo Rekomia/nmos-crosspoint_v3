@@ -239,8 +239,12 @@ export class NmosNodeApi {
                     manifest_href:      manifestUrl,
                     // Must reference an entry in node.interfaces[].name
                     // (`ifaceName` resolved above, defaults to the actual
-                    // OS interface owning advertiseHost).
-                    interface_bindings: [ifaceName],
+                    // OS interface owning advertiseHost). One entry per leg:
+                    // IS-04 lists a leg's interface once per leg, the same
+                    // one repeatedly if need be, and a controller reads a
+                    // leg without a binding as not wired (an ST 2022-7
+                    // virtual sender would lose its second leg).
+                    interface_bindings: parsed.transportParams.map(() => ifaceName),
                     caps:               {},
                     subscription:       { receiver_id: null, active: true }
                 };

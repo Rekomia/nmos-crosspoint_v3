@@ -855,8 +855,9 @@
 
 
         if(src && dst){
-          // Aktiver Punkt → Toggle Disconnect
-          if(dst.connectedFlow === src.id){
+          // Aktiver Punkt → Toggle Disconnect. Judged like the device cell:
+          // a take still in flight counts as done.
+          if(effectiveConnectedFlow(dst) === src.id){
             let idx = preparedConnectList.findIndex(c => !c.src && c.dst?.id === dst.id);
             if(idx !== -1){ preparedConnectList.splice(idx, 1); preparedConnectList = preparedConnectList; }
             else{
@@ -894,17 +895,9 @@
             // again. Nothing ever came apart again from a device cell.
             // connectedFlow is read from OUR state, not from the response: the
             // response describes what a connect WOULD do.
-            let allActive = newList.length > 0 && newList.every((n:any)=>{
-              if(!n.src || !n.dst) return false;
-              let live = findReceiverFlowById(n.dst.id);
-              return !!live && live.connectedFlow === n.src.id;
-            });
-            if(allActive){
-              cleanPreparedConnections(newList.map((n:any)=>({ srcDev: null, src: null, dstDev: n.dstDev, dst: n.dst })));
-              if(autoTake) takeConnect();
-              refreshMatrix(); updateGlobalTake();
-              return;
-            }
+            // With AutoTake off a click stages; a second click on the same
+            // cell withdraws what it staged — a connect, or an OFF — before
+            // anything is judged against the live state.
             let allPrepared = newList.length > 0 && newList.every(n =>
               preparedConnectList.some((c:any) => c.src?.id === n.src?.id && c.dst?.id === n.dst?.id)
             );
@@ -912,10 +905,23 @@
               preparedConnectList = preparedConnectList.filter((c:any) =>
                 !newList.some(n => c.src?.id === n.src?.id && c.dst?.id === n.dst?.id)
               );
-            }else{
-              cleanPreparedConnections(newList);
-              if(autoTake) takeConnect();
+              refreshMatrix(); updateGlobalTake();
+              return;
             }
+            let off = cellOffTargets(newList, sourceIdsOf(srcDev, src));
+            if(off && off.length > 0 && off.every((n:any)=> preparedConnectList.some((c:any)=> !c.src && c.dst?.id === n.dst.id))){
+              preparedConnectList = preparedConnectList.filter((c:any)=> !(!c.src && off!.some((n:any)=> n.dst.id === c.dst?.id)));
+              refreshMatrix(); updateGlobalTake();
+              return;
+            }
+            if(off){
+              cleanPreparedConnections(off.map((n:any)=>({ srcDev: null, src: null, dstDev: n.dstDev, dst: n.dst })));
+              if(autoTake) takeConnect();
+              refreshMatrix(); updateGlobalTake();
+              return;
+            }
+            cleanPreparedConnections(newList);
+            if(autoTake) takeConnect();
             refreshMatrix(); updateGlobalTake();
           }).catch((e)=>{
             // TODO, error handling
@@ -930,8 +936,11 @@
 
 
     export function takeConnect(){
-      doConnect(preparedConnectList);
-      workingConnectList = preparedConnectList;
+      // Takes overlap: each one ADDS its entries and, on its answer, removes
+      // only its own (doConnect) — another take's in-flight entries stay.
+      let take = preparedConnectList;
+      workingConnectList = workingConnectList.concat(take);
+      doConnect(take);
       preparedConnectList = [];
       refreshMatrix();
       updateGlobalTake();
@@ -1023,6 +1032,55 @@
 
     /** The receiver flow as WE currently know it — the connect response only
      *  says what a switch would produce, not what is switched right now. */
+    // What a receiver is connected to as far as the operator is concerned. A
+    // take still in flight counts as done: a click during it is judged on
+    // what is about to be, not on what IS-04 has not reported yet. A flow the
+    // view filter hides is not in `receivers`; the caller's own copy (from
+    // the server) stands in for it.
+    function effectiveConnectedFlow(dst:any):string{
+      for(let i = workingConnectList.length - 1; i >= 0; i--){
+        let c = workingConnectList[i];
+        if(c && c.dst && c.dst.id === dst.id){ return c.src ? c.src.id : ""; }
+      }
+      let live = findReceiverFlowById(dst.id) || dst;
+      return (live && live.connectedFlow) || "";
+    }
+
+    // The sender flows a cell stands for: one flow, or every flow of the
+    // device — hidden ones included, they feed receivers all the same.
+    function sourceIdsOf(srcDev:any, src:any):Set<string>{
+      let ids = new Set<string>();
+      if(src){ ids.add(src.id); return ids; }
+      if(!srcDev){ return ids; }
+      let devs:any[] = (sourceState && Array.isArray(sourceState.devices)) ? sourceState.devices : [];
+      let full = devs.find((d:any)=> d.id === srcDev.id) || srcDev;
+      for(const t in (full.senders || {})){
+        for(const f of (full.senders[t] || [])){ ids.add(f.id); }
+      }
+      return ids;
+    }
+
+    // A device-level cell is ON when every pair a connect would make is in
+    // place; then a click switches it OFF. Shared by the click and the hover
+    // preview, so the preview shows what the click will do.
+    //  - Only real pairs decide. A receiver flow the sender has no match for
+    //    comes back with src null (a connect disconnects it). Counting those
+    //    made every pair of devices with different flow counts look "not
+    //    switched", and the second click re-took everything (each connection
+    //    dropped and re-patched) instead of switching it off.
+    //  - Offline receivers and vanished senders can never show a connection,
+    //    so they get no say.
+    //  - OFF parts everything the cell's source feeds on these receivers, not
+    //    only the pairs: the cell lights up for any such connection (one
+    //    camera on two multiviewer tiles), and a lit cell has to go dark.
+    // Returns the entries to disconnect, or null when the click connects.
+    function cellOffTargets(list:any[], srcIds:Set<string>):any[]|null{
+      let pairs = list.filter((n:any)=> n.src && n.dst && n.src.available !== false && n.dst.available !== false);
+      let allActive = pairs.length > 0 && pairs.every((n:any)=> effectiveConnectedFlow(n.dst) === n.src.id);
+      if(!allActive){ return null; }
+      return list.filter((n:any)=> n.dst && n.dst.available !== false && srcIds.has(effectiveConnectedFlow(n.dst)));
+    }
+
     function findReceiverFlowById(id:string):any{
       for(const d of receivers){
         for(const t of flowTypes){
@@ -1049,6 +1107,23 @@
       let dstString = getDevcieNameString(dstDev,dst);
 
       let next = computePreviewConnections(srcString, dstString);
+      // A click on a switched cell turns it OFF — preview exactly that.
+      let flowIn = (kind:string, id:string)=>{
+        let devs:any[] = (sourceState && Array.isArray(sourceState.devices)) ? sourceState.devices : [];
+        for(const d of devs){
+          for(const t in (d[kind] || {})){
+            for(const f of (d[kind][t] || [])){ if(f.id === id){ return { dev: d, flow: f }; } }
+          }
+        }
+        return null;
+      };
+      let asObjects = next.map((e:any)=>{
+        let s = e.src ? flowIn("senders", e.src) : null;
+        let r = flowIn("receivers", e.dst);
+        return { src: s ? s.flow : null, dst: r ? r.flow : null, dstDev: r ? r.dev : null };
+      });
+      let off = cellOffTargets(asObjects, sourceIdsOf(srcDev, src));
+      if(off){ next = off.map((n:any)=>({ src: null, dst: n.dst.id })); }
       // Same preview as before (hovering along the same row/column) — skip
       // the full matrix repaint entirely. Element-wise compare instead of
       // two JSON.stringify calls on the hottest interaction path.
@@ -1124,7 +1199,11 @@
 
       if((srcFlows.length > 0 || disconnect) && dstFlows.length > 0){
         let usedSources:any[] = [];
-        for(let dstFlow of dstFlows){
+        // Same as the server: live flows first on both sides, unavailable
+        // ones only get what is left.
+        let liveFirst = (flows:any[]) => flows.filter((f:any)=> f.available !== false).concat(flows.filter((f:any)=> f.available === false));
+        let rank = (f:any) => (f.available === false ? 1 : 0);
+        for(let dstFlow of liveFirst(dstFlows)){
           let picked:any = null;
           if(!disconnect){
             for(let srcFlow of srcFlows){
@@ -1138,10 +1217,12 @@
                 if(picked == null){
                   picked = srcFlow;
                   usedSources.push(srcFlow.id);
-                }else if(picked.num > srcFlow.num){
-                  // Server behaviour: the earlier pick's id stays in
-                  // usedSources and the replacement's id is not added.
+                }else if(rank(srcFlow) < rank(picked) || (rank(srcFlow) === rank(picked) && picked.num > srcFlow.num)){
+                  // Same as the server: the earlier pick is free again,
+                  // the replacement is taken.
+                  usedSources = usedSources.filter((id:any)=> id !== picked.id);
                   picked = srcFlow;
+                  usedSources.push(srcFlow.id);
                 }
               }
             }
@@ -1167,10 +1248,10 @@
       // TODO Activating....
       ServerConnector.post("makeconnection", {multiple:reducedList,preview:false}).then((response:any)=>{
         showConnectResponse(response.data);
-        workingConnectList = [];
+        workingConnectList = workingConnectList.filter((c:any)=> !list.includes(c));
         refreshMatrix();
       }).catch((e)=>{
-        workingConnectList = [];
+        workingConnectList = workingConnectList.filter((c:any)=> !list.includes(c));
         refreshMatrix();
       });
       // TODO error
@@ -1211,9 +1292,10 @@
             if( flow.id == c.dst?.id ){ return "workingdisconnect" }
         }
       }
+      // Preview entries carry plain ids, not flow objects.
       for(let c of previewConnectList){
         if(!c.src && c.dst){
-            if( flow.id == c.dst?.id ){ return "previewdisconnect" }
+            if( flow.id == (typeof c.dst === "string" ? c.dst : c.dst?.id) ){ return "previewdisconnect" }
         }
       }
       return false
