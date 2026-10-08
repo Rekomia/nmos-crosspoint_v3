@@ -1184,8 +1184,8 @@ export class NmosRegistryConnector {
             // TODO: other versions
             if(c.type=="urn:x-nmos:control:cm-ctrl/v1.0"){
                 try{
-                    let io = await deviceRequest(deviceQueueKey(postData, c.href), {method:"get", url:c.href + "/io", timeout:10000});
-                    let map = await deviceRequest(deviceQueueKey(postData, c.href), {method:"get", url:c.href + "/map/active", timeout:10000});
+                    let io = await deviceRequest(deviceQueueKey(postData, c.href), {method:"get", url:c.href + "/io", timeout:10000}, true);
+                    let map = await deviceRequest(deviceQueueKey(postData, c.href), {method:"get", url:c.href + "/map/active", timeout:10000}, true);
 
                     for(let k in io.data.outputs){
 
@@ -1300,7 +1300,7 @@ export class NmosRegistryConnector {
                     let _activeUnused = active; // kept for backwards compatibility
                     if (manifest_href && senderId) {
                         let manifestDevice = this.nmosState.devices?.[source?.device_id];
-                        deviceRequest(deviceQueueKey(manifestDevice, g.post.manifest_href), {method:"get", url:g.post.manifest_href, timeout:10000}).then(response => {
+                        deviceRequest(deviceQueueKey(manifestDevice, g.post.manifest_href), {method:"get", url:g.post.manifest_href, timeout:10000}, true).then(response => {
                             if(response.data.length > 10){
                                 // TODO Check for BAD SDP Files, is this already enough, more than 10 chars and more than 0 flows
                                 let sdp = sdpTransform.parse(response.data);
@@ -1424,7 +1424,7 @@ export class NmosRegistryConnector {
                     let gotData = false;
                     for(let href of active_href){
                         try{
-                            let response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000});
+                            let response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000}, true);
                             this.nmosState.senderActiveData[senderId] = response.data;
                             gotData = true;
                             break;
@@ -2382,12 +2382,12 @@ export class NmosRegistryConnector {
 
 
     /** A receiver's IS-05 /active, read on one control address. */
-    private async readReceiverActiveAt(receiverId:string, controlHref:string, device:any):Promise<any|null>{
+    private async readReceiverActiveAt(receiverId:string, controlHref:string, device:any, background = false):Promise<any|null>{
         let href = controlHref;
         if(href[href.length-1] !== "/"){ href += "/"; }
         href += "single/receivers/" + receiverId + "/active";
         try{
-            const response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000});
+            const response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000}, background);
             return (response && response.data && typeof response.data === "object") ? response.data : null;
         }catch(e){
             return null;
@@ -2443,7 +2443,7 @@ export class NmosRegistryConnector {
         // After the device has switched, not while it still runs the old stream.
         setTimeout(async () => {
             try{
-                let active = await this.readReceiverActiveAt(receiverId, controlHref, device);
+                let active = await this.readReceiverActiveAt(receiverId, controlHref, device, true);
                 let running = NmosRegistryConnector.videoFormatOf(active?.transport_file?.data);
                 if(running && running !== wanted){
                     let label = this.nmosState.receivers?.[receiverId]?.label;
@@ -2935,7 +2935,7 @@ export class NmosRegistryConnector {
                         if(href[href.length-1] !== "/"){ href += "/"; }
                         href += "single/senders/" + senderId + "/active/";
                         try{
-                            let response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000});
+                            let response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000}, true);
                             this.nmosState.senderActiveData[senderId] = response.data;
                             return true;
                         }catch(e:any){
