@@ -86,13 +86,22 @@ export interface DeviceRequestOptions {
     /** Sent even while the address is being skipped. */
     force?: boolean;
     /**
+     * A read with no fallback (a sender's SDP): not held back by a skip that
+     * only covers reads — a slow /active read elsewhere on the device says
+     * nothing about it.
+     */
+    noFallback?: boolean;
+    /**
      * Safe to send twice: sent again once when the device dropped it while
      * busy with others. GETs always are.
      */
     idempotent?: boolean;
 }
 
-/** Sends one request from inside withDevice(). */
+/**
+ * Sends one request from inside withDevice(). A failure it would have sent
+ * again outside (refused while the device was busy) carries `resend: true`.
+ */
 export type DeviceSend = (config:AxiosRequestConfig, opts?:DeviceRequestOptions) => Promise<AxiosResponse>;
 
 type Task = () => Promise<void>;
@@ -100,9 +109,15 @@ interface Lane { running:number, now:Task[], later:Task[] }
 const lanes:Map<string, Lane> = new Map();
 const serialNodes:Set<string> = new Set();
 
-interface Skip { until:number, code:string, what:string, readsOnly:boolean }
+// "all": nothing goes out. "reads": GETs with a fallback stay back. "writes":
+// PATCHes stay back — the device answers reads but hangs on activations.
+interface Skip { until:number, code:string, what:string, kind:"all"|"reads"|"writes" }
 const originSkips:Map<string, Skip> = new Map();
 const nodeSkips:Map<string, Skip> = new Map();
+// When each address last answered anything, error statuses included.
+const lastAnswer:Map<string, number> = new Map();
+/** A refused connection counts as overload only from an address that answered this recently. */
+const ALIVE_MS = 2000;
 
 function originOf(url:string):string{
     try{
@@ -142,11 +157,12 @@ export function noAnswer(e:any):boolean{
 }
 
 /**
- * Skip every request to this node for a while: it took a request and did not
- * answer it, and it does not answer a read either.
+ * Skip this node's requests for a while: it left a PATCH unanswered. With
+ * `writesOnly` (it still answers reads) only its PATCHes stay back, until
+ * one of them gets an answer again.
  */
-export function markUnresponsive(queueKey:string, what:string){
-    nodeSkips.set(queueKey, { until: Date.now() + SKIP_MS, code: "ECONNABORTED", what, readsOnly: false });
+export function markUnresponsive(queueKey:string, what:string, writesOnly = false){
+    nodeSkips.set(queueKey, { until: Date.now() + SKIP_MS, code: "ECONNABORTED", what, kind: writesOnly ? "writes" : "all" });
 }
 
 function laneOf(queueKey:string):Lane{
@@ -191,43 +207,55 @@ function enqueue(queueKey:string, task:Task, background:boolean, front = false){
     pump(queueKey);
 }
 
-function activeSkip(queueKey:string, origin:string, method:string):Skip|null{
+function activeSkip(queueKey:string, origin:string, method:string, noFallback = false):{ skip:Skip, node:boolean }|null{
     const now = Date.now();
-    for(const [map, key] of [[nodeSkips, queueKey], [originSkips, origin]] as [Map<string, Skip>, string][]){
+    for(const [map, key, node] of [[nodeSkips, queueKey, true], [originSkips, origin, false]] as [Map<string, Skip>, string, boolean][]){
         const skip = map.get(key);
         if(!skip){ continue; }
         if(skip.until <= now){
             map.delete(key);
             continue;
         }
-        if(!skip.readsOnly || method === "get"){
-            return skip;
+        if(skip.kind === "all" ||
+           (skip.kind === "reads" && method === "get" && !noFallback) ||
+           (skip.kind === "writes" && method !== "get")){
+            return { skip, node };
         }
     }
     return null;
 }
 
+/** The device answered: lift what this answer disproves. */
+function answered(queueKey:string, origin:string, method:string){
+    lastAnswer.set(origin, Date.now());
+    originSkips.delete(origin);
+    // A read answered says nothing about PATCHes that hang.
+    if(method !== "get" || nodeSkips.get(queueKey)?.kind !== "writes"){
+        nodeSkips.delete(queueKey);
+    }
+}
+
 async function attempt(queueKey:string, config:AxiosRequestConfig, opts:DeviceRequestOptions):Promise<AxiosResponse>{
     const origin = originOf(config.url || "");
+    const method = methodOf(config);
     if(!opts.force){
-        const skip = activeSkip(queueKey, origin, methodOf(config));
-        if(skip){
-            const err:any = new AxiosError("not sent: " + origin + " " + skip.what + " " + Math.round((Date.now() - (skip.until - SKIP_MS)) / 1000) +
-                " s ago (" + skip.code + ")", "ESKIPPED", config as any);
-            err.retryAt = skip.until;
+        const hit = activeSkip(queueKey, origin, method, !!opts.noFallback);
+        if(hit){
+            const ago = Math.round((Date.now() - (hit.skip.until - SKIP_MS)) / 1000);
+            const err:any = new AxiosError("not sent: " + (hit.node ? "the device " : origin + " ") + hit.skip.what + " " + ago +
+                " s ago (" + hit.skip.code + ")", "ESKIPPED", config as any);
+            err.retryAt = hit.skip.until;
             throw err;
         }
     }
     try{
         const response = await axios.request({ ...config, httpAgent, httpsAgent });
-        originSkips.delete(origin);
-        nodeSkips.delete(queueKey);
+        answered(queueKey, origin, method);
         return response;
     }catch(e:any){
         if(e?.response){
             // An error status is an answer: the device is there.
-            originSkips.delete(origin);
-            nodeSkips.delete(queueKey);
+            answered(queueKey, origin, method);
         }
         throw e;
     }
@@ -243,8 +271,12 @@ function learn(queueKey:string, config:AxiosRequestConfig, opts:DeviceRequestOpt
     const origin = originOf(config.url || "");
     const method = methodOf(config);
     const code = e.code;
-    if(crowded && (RESET_ERRORS.has(code) || code === "ECONNREFUSED")){
-        // Overloaded by parallel requests, not gone: no skip.
+    // Overloaded, not gone: it dropped this while busy with others. A reset
+    // connection was accepted first, so the device is up. A refused one
+    // counts only from an address that has just been answering — a device
+    // that is rebooting, or an address nothing listens on, has not.
+    const alive = (lastAnswer.get(origin) || 0) > Date.now() - ALIVE_MS;
+    if(crowded && (RESET_ERRORS.has(code) || (code === "ECONNREFUSED" && alive))){
         if(!serialNodes.has(queueKey)){
             serialNodes.add(queueKey);
             SyncLog.log("warning", "device_http", "Device " + queueKey + " (" + origin + ") dropped a connection while handling several requests (" +
@@ -253,12 +285,11 @@ function learn(queueKey:string, config:AxiosRequestConfig, opts:DeviceRequestOpt
         return code === "ECONNREFUSED" || method === "get" || !!opts.idempotent;
     }
     if(CONNECT_ERRORS.has(code)){
-        originSkips.set(origin, { until: Date.now() + SKIP_MS, code, what: "did not take a connection", readsOnly: false });
-    }else if(code === "ECONNABORTED" && method === "get" && !opts.background && !activeSkip(queueKey, origin, "patch")){
-        // A read went unanswered: skip further reads (they all have a fall
-        // back), not the writes — a slow 5 s read says little about a 30 s
-        // PATCH.
-        originSkips.set(origin, { until: Date.now() + SKIP_MS, code, what: "left a read unanswered", readsOnly: true });
+        originSkips.set(origin, { until: Date.now() + SKIP_MS, code, what: "did not take a connection", kind: "all" });
+    }else if(code === "ECONNABORTED" && method === "get" && !opts.background && !originSkips.has(origin)){
+        // A read went unanswered: skip further reads that have a fallback,
+        // not the writes — a slow 5 s read says little about a 30 s PATCH.
+        originSkips.set(origin, { until: Date.now() + SKIP_MS, code, what: "left a read unanswered", kind: "reads" });
     }
     return false;
 }
@@ -285,9 +316,12 @@ export function deviceRequest<T = any>(queueKey:string, config:AxiosRequestConfi
                     enqueue(queueKey, task, background, true);
                     return;
                 }
-                if(background && e?.code === "ESKIPPED" && !deferred && typeof e.retryAt === "number"){
+                if(background && neverConnected(e) && !deferred){
+                    // Nobody waits for it: try once more when the skip is over.
                     deferred = true;
-                    setTimeout(() => enqueue(queueKey, task, background), Math.max(0, e.retryAt - Date.now()) + 100);
+                    const at = typeof e.retryAt === "number" ? e.retryAt :
+                               (originSkips.get(originOf(config.url || ""))?.until || Date.now() + SKIP_MS);
+                    setTimeout(() => enqueue(queueKey, task, background), Math.max(0, at - Date.now()) + 100);
                     return;
                 }
                 reject(e);
@@ -310,8 +344,10 @@ export function withDevice<T>(queueKey:string, body:(send:DeviceSend) => Promise
             let crowded = busy(queueKey) > 1;
             try{
                 return await attempt(queueKey, config, opts);
-            }catch(e){
-                learn(queueKey, config, { ...opts, idempotent: false }, e, crowded || busy(queueKey) > 1);
+            }catch(e:any){
+                if(learn(queueKey, config, { ...opts, idempotent: false }, e, crowded || busy(queueKey) > 1) && e){
+                    e.resend = true;
+                }
                 throw e;
             }
         };

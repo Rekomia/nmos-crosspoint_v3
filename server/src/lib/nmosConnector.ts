@@ -2012,10 +2012,10 @@ export class NmosRegistryConnector {
                 // Bounded: an auto-activation holds its claim until this
                 // returns, and a device that accepts the connection but
                 // never answers must not keep it forever.
-                let sdp = await deviceRequest(deviceQueueKey(device, sender.manifest_href), {method:"get", url:sender.manifest_href, timeout:10000})
+                let sdp = await deviceRequest(deviceQueueKey(device, sender.manifest_href), {method:"get", url:sender.manifest_href, timeout:10000}, {noFallback:true})
                 info.manifestFile = sdp.data;
             }catch(e){
-                info.error = "Can not load Manifest from sender: " + e.code;
+                info.error = "Can not load Manifest from sender: " + e.code + (e.code === "ESKIPPED" ? " (" + e.message + ")" : "");
                 return info;
             }
         //}
@@ -2298,16 +2298,22 @@ export class NmosRegistryConnector {
             // The PATCH, the read that checks an unanswered one and the second
             // try run as one unit on the device: nothing of the device's other
             // receivers squeezes in between.
-            let outcome:any = await withDevice(queueKey, async (send) => {
+            let unit = () => withDevice(queueKey, async (send) => {
                 let put = (body:any) => send({method:"patch", url:patchHref, data:body, timeout:30000});
                 let readBack = async (wait:number) => {
                     await sleep(wait);
-                    try{
-                        let r = await send({method:"get", url:activeHref, timeout:5000}, {force:true});
-                        return (r && r.data && typeof r.data === "object") ? r.data : null;
-                    }catch(e){
-                        return null;
+                    for(let i = 0; i < 2; i++){
+                        try{
+                            let r = await send({method:"get", url:activeHref, timeout:5000}, {force:true});
+                            return (r && r.data && typeof r.data === "object") ? r.data : null;
+                        }catch(e:any){
+                            // Dropped while the device was busy with other
+                            // requests: it takes one at a time now.
+                            if(!e?.resend){ return null; }
+                            await sleep(200);
+                        }
                     }
+                    return null;
                 };
 
                 // The device took the PATCH and closed the connection without
@@ -2318,19 +2324,23 @@ export class NmosRegistryConnector {
                 let recover = async (sent:any, err:any):Promise<any> => {
                     let inconclusive = showedBefore && !!sent.transport_file;
                     let shows = (active:any) => !!active && !inconclusive && NmosRegistryConnector.activeShowsPatch(active, sent);
+                    let howLost = (x:any) => x.code === "ECONNABORTED" ? "did not answer the PATCH in time" : "closed the connection without answering the PATCH";
                     let active = await readBack(300);
                     if(shows(active)){
-                        SyncLog.log("warning", "nmos_connect", "Receiver " + receiverId + " closed the connection without answering the PATCH (" +
+                        SyncLog.log("warning", "nmos_connect", "Receiver " + receiverId + " " + howLost(err) + " (" +
                             err.message + "), but its /active shows the new parameters — taken as done.", {href:patchHref, data:sent});
                         return {sent, result:{status:"no answer", data:active}};
                     }
                     if(err.code === "ECONNABORTED"){
                         // 30 s without an answer. Not again: a device that
-                        // hangs will hang again. When it does not answer the
-                        // read either, everything else queued for it is
-                        // skipped instead of waiting out the same timeouts.
+                        // hangs will hang again. Everything else queued for
+                        // it is skipped instead of waiting out the same
+                        // timeout: all of it when it does not answer the read
+                        // either, its PATCHes when it still answers reads.
                         if(!active){
                             markUnresponsive(queueKey, "left a PATCH and the /active read after it unanswered");
+                        }else{
+                            markUnresponsive(queueKey, "left a PATCH unanswered and did not apply it", true);
                         }
                     }else{
                         try{
@@ -2341,6 +2351,11 @@ export class NmosRegistryConnector {
                         }catch(e2:any){
                             if(e2?.response){
                                 return {error:e2};
+                            }
+                            if(e2?.resend){
+                                // Refused while the device was busy: once
+                                // more, in line with the rest.
+                                return {next:e2};
                             }
                             err = e2;
                             if(noAnswer(e2)){
@@ -2403,8 +2418,14 @@ export class NmosRegistryConnector {
                             return {sent:retry, result};
                         }catch(e2:any){
                             let answer = e2;
+                            if(e2?.resend){
+                                return {next:e2};
+                            }
                             if(noAnswer(e2)){
                                 let r = await recover(retry, e2);
+                                if(r.next){
+                                    return r;
+                                }
                                 if(!r.error){
                                     refused();
                                     return r;
@@ -2432,6 +2453,12 @@ export class NmosRegistryConnector {
                 }
             });
 
+            let outcome:any = await unit();
+            if(outcome.next?.resend){
+                // Refused while the device was busy with other requests. It
+                // takes one at a time now: once more, in line with the rest.
+                outcome = await unit();
+            }
             if(outcome.next){
                 SyncLog.log("info", "nmos_connect", "Patch on " + patchHref + " not sent (" + outcome.next.message + "), trying next.");
                 notSent.push(href.href + ": " + outcome.next.message);
@@ -2494,10 +2521,16 @@ export class NmosRegistryConnector {
         let p = fmtp[1];
         let w = /(?:^|;)\s*width=(\d+)/.exec(p);
         let h = /(?:^|;)\s*height=(\d+)/.exec(p);
-        let r = /(?:^|;)\s*exactframerate=(\d+)(?:\/(\d+))?/.exec(p);
+        let r = /(?:^|;)\s*exactframerate=(\d+(?:\.\d+)?)(?:\/(\d+))?/.exec(p);
         if(!w || !h || !r){ return null; }
         let interlaced = /(?:^|;)\s*interlace\b/.test(p);
-        let rate = Math.round(Number(r[1]) / Number(r[2] || 1) * (interlaced ? 2 : 1) * 100) / 100;
+        // PsF: progressive frames carried as two segments.
+        let segmented = interlaced && /(?:^|;)\s*segmented\b/.test(p);
+        let frames = Number(r[1]) / Number(r[2] || 1);
+        if(segmented){
+            return w[1] + "x" + h[1] + "psf" + Math.round(frames * 100) / 100;
+        }
+        let rate = Math.round(frames * (interlaced ? 2 : 1) * 100) / 100;
         return w[1] + "x" + h[1] + (interlaced ? "i" : "p") + rate;
     }
 
