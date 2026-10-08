@@ -22,7 +22,7 @@ import * as sdpTransform from 'sdp-transform';
 import { CrosspointAbstraction, CrosspointConnectionSenderInfo } from "./crosspointAbstraction";
 import { MulticastLeaseManager } from "./multicastLeaseManager";
 import { DdnsService } from "./ddnsService";
-import { deviceQueueKey, deviceRequest, neverConnected, noAnswer } from "./deviceHttp";
+import { deviceQueueKey, deviceRequest, markUnresponsive, neverConnected, noAnswer, withDevice } from "./deviceHttp";
 
 const fs = require("fs");
 
@@ -1184,8 +1184,8 @@ export class NmosRegistryConnector {
             // TODO: other versions
             if(c.type=="urn:x-nmos:control:cm-ctrl/v1.0"){
                 try{
-                    let io = await deviceRequest(deviceQueueKey(postData, c.href), {method:"get", url:c.href + "/io", timeout:10000}, true);
-                    let map = await deviceRequest(deviceQueueKey(postData, c.href), {method:"get", url:c.href + "/map/active", timeout:10000}, true);
+                    let io = await deviceRequest(deviceQueueKey(postData, c.href), {method:"get", url:c.href + "/io", timeout:10000}, {background:true});
+                    let map = await deviceRequest(deviceQueueKey(postData, c.href), {method:"get", url:c.href + "/map/active", timeout:10000}, {background:true});
 
                     for(let k in io.data.outputs){
 
@@ -1300,7 +1300,7 @@ export class NmosRegistryConnector {
                     let _activeUnused = active; // kept for backwards compatibility
                     if (manifest_href && senderId) {
                         let manifestDevice = this.nmosState.devices?.[source?.device_id];
-                        deviceRequest(deviceQueueKey(manifestDevice, g.post.manifest_href), {method:"get", url:g.post.manifest_href, timeout:10000}, true).then(response => {
+                        deviceRequest(deviceQueueKey(manifestDevice, g.post.manifest_href), {method:"get", url:g.post.manifest_href, timeout:10000}, {background:true}).then(response => {
                             if(response.data.length > 10){
                                 // TODO Check for BAD SDP Files, is this already enough, more than 10 chars and more than 0 flows
                                 let sdp = sdpTransform.parse(response.data);
@@ -1424,7 +1424,7 @@ export class NmosRegistryConnector {
                     let gotData = false;
                     for(let href of active_href){
                         try{
-                            let response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000}, true);
+                            let response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000}, {background:true});
                             this.nmosState.senderActiveData[senderId] = response.data;
                             gotData = true;
                             break;
@@ -2269,13 +2269,19 @@ export class NmosRegistryConnector {
         // the picture just stays black and nothing else reports it.
         let patched = (sent:any, result:any, patchHref:string, controlHref:string) => {
             if(!sent.transport_file && senderInfo.senderId != "disconnect" && senderInfo.manifestFile){
-                this.checkReceiverFormat(receiverId, controlHref, device, senderInfo.manifestFile);
+                this.checkReceiverFormat(receiverId, controlHref, device, senderInfo.manifestFile, senderInfo.senderId);
             }
             // The device's own answer goes into the log line: what it
             // staged is the only way to see which of our parameters it
             // took, silently changed or ignored.
             return SyncLog.log("success", "nmos_connect", "Successfully patched: "+receiverId, {href:patchHref, data:sent, status:result?.status, response:result?.data});
         };
+
+        // /active already showed what this PATCH asks for (the same route
+        // taken again). Reading it back after an unanswered PATCH then proves
+        // nothing about a transport file that may have changed.
+        let showedBefore = !!receiverActive && NmosRegistryConnector.activeShowsPatch(receiverActive, patch);
+        let notSent:string[] = [];
 
         for(let href of controlHrefs){
             // TODO, version specific things
@@ -2286,51 +2292,93 @@ export class NmosRegistryConnector {
                 fixSlash = "/"
             }
             let patchHref = href.href + fixSlash + "single/receivers/" + receiverId + "/staged"
+            let activeHref = href.href + fixSlash + "single/receivers/" + receiverId + "/active"
             let queueKey = deviceQueueKey(device, patchHref);
-            try{
-                let result = await deviceRequest(queueKey, {method:"patch", url:patchHref, data:patch, timeout:30000});
-                return patched(patch, result, patchHref, href.href);
-            }catch(first){
-                let e:any = first;
-                if (axios.isAxiosError(e)) {
-                    if(neverConnected(e)){
-                        // The request never reached the device — its next
-                        // control address may still answer.
-                        SyncLog.log("info", "nmos_connect", "Patch on "+patchHref+" did not connect (" + e.code + "), trying next.");
-                        continue;
+
+            // The PATCH, the read that checks an unanswered one and the second
+            // try run as one unit on the device: nothing of the device's other
+            // receivers squeezes in between.
+            let outcome:any = await withDevice(queueKey, async (send) => {
+                let put = (body:any) => send({method:"patch", url:patchHref, data:body, timeout:30000});
+                let readBack = async (wait:number) => {
+                    await sleep(wait);
+                    try{
+                        let r = await send({method:"get", url:activeHref, timeout:5000}, {force:true});
+                        return (r && r.data && typeof r.data === "object") ? r.data : null;
+                    }catch(e){
+                        return null;
                     }
-                    if(noAnswer(e)){
-                        // The device took the PATCH and closed the connection
-                        // without an answer ("socket hang up"), or did not
-                        // answer in time. Whether it applied it is open: a
-                        // FusioN given six at once dropped four and still
-                        // showed all six receivers patched. Ask the device
-                        // what it runs now before sending it again.
-                        await sleep(300);
-                        let active = await this.readReceiverActiveAt(receiverId, href.href, device);
-                        if(active && NmosRegistryConnector.activeShowsPatch(active, patch)){
-                            SyncLog.log("warning", "nmos_connect", "Receiver " + receiverId + " closed the connection without answering the PATCH (" +
-                                e.message + "), but its /active shows the new parameters — taken as done.", {href:patchHref, data:patch});
-                            return patched(patch, {status:"no answer", data:active}, patchHref, href.href);
+                };
+
+                // The device took the PATCH and closed the connection without
+                // an answer ("socket hang up"), or did not answer in time.
+                // Whether it applied it is open: a FusioN given six at once
+                // dropped four and still showed all six receivers patched.
+                // Ask the device what it runs before sending it again.
+                let recover = async (sent:any, err:any):Promise<any> => {
+                    let inconclusive = showedBefore && !!sent.transport_file;
+                    let shows = (active:any) => !!active && !inconclusive && NmosRegistryConnector.activeShowsPatch(active, sent);
+                    let active = await readBack(300);
+                    if(shows(active)){
+                        SyncLog.log("warning", "nmos_connect", "Receiver " + receiverId + " closed the connection without answering the PATCH (" +
+                            err.message + "), but its /active shows the new parameters — taken as done.", {href:patchHref, data:sent});
+                        return {sent, result:{status:"no answer", data:active}};
+                    }
+                    if(err.code === "ECONNABORTED"){
+                        // 30 s without an answer. Not again: a device that
+                        // hangs will hang again. When it does not answer the
+                        // read either, everything else queued for it is
+                        // skipped instead of waiting out the same timeouts.
+                        if(!active){
+                            markUnresponsive(queueKey, "left a PATCH and the /active read after it unanswered");
                         }
-                        // Once more. Not after a timeout: that already took
-                        // 30 s, and a device that hangs will hang again.
-                        if(e.code !== "ECONNABORTED"){
-                            try{
-                                let result = await deviceRequest(queueKey, {method:"patch", url:patchHref, data:patch, timeout:30000});
-                                SyncLog.log("info", "nmos_connect", "Receiver " + receiverId + " closed the connection without answering the first PATCH (" +
-                                    e.message + ") — the second one went through.");
-                                return patched(patch, result, patchHref, href.href);
-                            }catch(e2){
-                                e = e2;
+                    }else{
+                        try{
+                            let result = await put(sent);
+                            SyncLog.log("info", "nmos_connect", "Receiver " + receiverId + " closed the connection without answering the first PATCH (" +
+                                err.message + ") — the second one went through.");
+                            return {sent, result};
+                        }catch(e2:any){
+                            if(e2?.response){
+                                return {error:e2};
+                            }
+                            err = e2;
+                            if(noAnswer(e2)){
+                                active = await readBack(1000);
+                                if(shows(active)){
+                                    SyncLog.log("warning", "nmos_connect", "Receiver " + receiverId + " answered neither PATCH (" + e2.message +
+                                        "), but its /active shows the new parameters — taken as done.", {href:patchHref, data:sent});
+                                    return {sent, result:{status:"no answer", data:active}};
+                                }
                             }
                         }
-                        if(noAnswer(e) || neverConnected(e)){
-                            let id = SyncLog.log("error", "nmos_connect", "Receiver " + receiverId + " did not answer the PATCH (" + e.message +
-                                ") and its /active does not show the new parameters.", {controlHrefs, failedControl:patchHref, patch, code:e.code, message:e.message,
-                                active: active ?? undefined});
-                            throw new LoggedError("Receiver did not answer: " + e.message, id);
+                    }
+                    let why = !active ? "its /active could not be read" :
+                              inconclusive ? "its /active showed these parameters already before, so it cannot tell whether the PATCH landed" :
+                              "its /active does not show the new parameters";
+                    let id = SyncLog.log("error", "nmos_connect", "Receiver " + receiverId + " did not answer the PATCH (" + err.message + ") and " + why + ".",
+                        {controlHrefs, failedControl:patchHref, patch:sent, code:err.code, message:err.message, active:active ?? undefined});
+                    throw new LoggedError("Receiver did not answer: " + err.message, id);
+                };
+
+                try{
+                    return {sent:patch, result:await put(patch)};
+                }catch(first){
+                    let e:any = first;
+                    if(!axios.isAxiosError(e)){
+                        throw new LoggedError("Patch Failed: " + e?.message);
+                    }
+                    if(neverConnected(e)){
+                        // Never reached the device — its next control address
+                        // may still answer.
+                        return {next:e};
+                    }
+                    if(noAnswer(e)){
+                        let r = await recover(patch, e);
+                        if(!r.error){
+                            return r;
                         }
+                        e = r.error;
                     }
                     // A receiver that will not take a transport file at all
                     // rejects the whole PATCH over it. Everything the join
@@ -2342,15 +2390,27 @@ export class NmosRegistryConnector {
                     if(e.response?.status === 400 && patch.transport_file){
                         let retry:any = { ...patch };
                         delete retry.transport_file;
-                        try{
-                            let result = await deviceRequest(queueKey, {method:"patch", url:patchHref, data:retry, timeout:30000});
+                        let refused = () => {
                             this.transportFileUnsupported.add(href.href);
                             SyncLog.log("warning", "nmos_connect", "Receiver " + receiverId + " refuses a transport file on its IS-05 " +
                                 href.version + " endpoint — patched without it. The stream parameters are carried by transport_params; " +
                                 "the device has to know the media format by itself. Every receiver behind " + href.href +
                                 " now leaves the file out from the start.", {href:patchHref, status:e.response?.status, error:e.response?.data});
-                            return patched(retry, result, patchHref, href.href);
+                        };
+                        try{
+                            let result = await put(retry);
+                            refused();
+                            return {sent:retry, result};
                         }catch(e2:any){
+                            let answer = e2;
+                            if(noAnswer(e2)){
+                                let r = await recover(retry, e2);
+                                if(!r.error){
+                                    refused();
+                                    return r;
+                                }
+                                answer = r.error;
+                            }
                             // Not the transport file then. Say so with the
                             // device's answer — without this line the retry
                             // is invisible and the log looks as if it never
@@ -2358,8 +2418,8 @@ export class NmosRegistryConnector {
                             // when the real cause is somewhere else.
                             SyncLog.log("warning", "nmos_connect", "Receiver " + receiverId +
                                 " rejected the PATCH without the transport file as well — the file is not the problem here.",
-                                { href: patchHref, data: retry, status: e2?.response?.status, error: e2?.response?.data,
-                                  message: e2?.message });
+                                { href: patchHref, data: retry, status: answer?.response?.status, error: answer?.response?.data,
+                                  message: answer?.message });
                         }
                     }
                     // TODO....
@@ -2369,14 +2429,18 @@ export class NmosRegistryConnector {
                     }
                     let id = SyncLog.log("error", "nmos_connect", "Receiver "+receiverId+" returned Error: "+e.code,{controlHrefs,failedControl:patchHref,patch, status:e.response?.status, error:e.response?.data, message:e.message});
                     throw new LoggedError("Receiver returned Error: "+e.code, id);
-                }else{
-                    throw new LoggedError("Patch Failed: "+e.message);
                 }
-                
+            });
+
+            if(outcome.next){
+                SyncLog.log("info", "nmos_connect", "Patch on " + patchHref + " not sent (" + outcome.next.message + "), trying next.");
+                notSent.push(href.href + ": " + outcome.next.message);
+                continue;
             }
+            return patched(outcome.sent, outcome.result, patchHref, href.href);
         }
-        let id = SyncLog.log("error", "nmos_connect", "Receiver Control unreachable.",{controlHrefs,patch});
-        throw new LoggedError("Receiver Control unreachable.", id);
+        let id = SyncLog.log("error", "nmos_connect", "Receiver Control unreachable." + (notSent.length ? " " + notSent.join("; ") : ""), {controlHrefs, patch});
+        throw new LoggedError("Receiver Control unreachable." + (notSent.length ? " " + notSent.join("; ") : ""), id);
     }
 
 
@@ -2387,7 +2451,7 @@ export class NmosRegistryConnector {
         if(href[href.length-1] !== "/"){ href += "/"; }
         href += "single/receivers/" + receiverId + "/active";
         try{
-            const response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000}, background);
+            const response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000}, {background});
             return (response && response.data && typeof response.data === "object") ? response.data : null;
         }catch(e){
             return null;
@@ -2437,18 +2501,22 @@ export class NmosRegistryConnector {
         return w[1] + "x" + h[1] + (interlaced ? "i" : "p") + rate;
     }
 
-    private checkReceiverFormat(receiverId:string, controlHref:string, device:any, senderSdp:string){
+    private checkReceiverFormat(receiverId:string, controlHref:string, device:any, senderSdp:string, senderId:string|null){
         let wanted = NmosRegistryConnector.videoFormatOf(senderSdp);
         if(!wanted){ return; }
         // After the device has switched, not while it still runs the old stream.
         setTimeout(async () => {
             try{
                 let active = await this.readReceiverActiveAt(receiverId, controlHref, device, true);
-                let running = NmosRegistryConnector.videoFormatOf(active?.transport_file?.data);
+                // Taken over by another take in the meantime: not ours to judge.
+                if(!active || active.master_enable === false || (senderId && active.sender_id && active.sender_id !== senderId)){ return; }
+                let running = NmosRegistryConnector.videoFormatOf(active.transport_file?.data);
                 if(running && running !== wanted){
                     let label = this.nmosState.receivers?.[receiverId]?.label;
+                    let senderLabel = senderId ? this.nmosState.senders?.[senderId]?.label : null;
                     SyncLog.log("warning", "nmos_connect", "Receiver " + (label ? label + " (" + receiverId + ")" : receiverId) + " runs " + running +
-                        " but the sender sends " + wanted + ". It does not take the format from the sender's SDP — set " + wanted + " on the device.");
+                        " but sender " + (senderLabel || senderId || "?") + " sends " + wanted +
+                        ". It does not take the format from the sender's SDP — set " + wanted + " on the device.");
                 }
             }catch(e){}
         }, 3000);
@@ -2507,6 +2575,7 @@ export class NmosRegistryConnector {
             };
 
 
+            let notSent:string[] = [];
             for(let href of controlHrefs){
                 // TODO, version specific things
                 let fixSlash = ""
@@ -2517,14 +2586,15 @@ export class NmosRegistryConnector {
                 }
                 let patchHref = href.href + fixSlash + "single/senders/" + senderId + "/staged";
                 try{
-                    let result = await deviceRequest(deviceQueueKey(device, patchHref), {method:"patch", url:patchHref, data:patch, timeout:30000});
+                    let result = await deviceRequest(deviceQueueKey(device, patchHref), {method:"patch", url:patchHref, data:patch, timeout:30000}, {idempotent:true});
                     SyncLog.log("success", "nmos", "Successfully enabled: "+senderId, {href:patchHref, data:patch, status:result?.status, response:result?.data})
                     return;
                 }catch(e){
                     if (axios.isAxiosError(e)) {
                         if(neverConnected(e)){
                             // NEXT
-                            SyncLog.log("info", "nmos", "Patch on "+senderId+" did not connect (" + e.code + "), trying next.");
+                            SyncLog.log("info", "nmos", "Patch on "+senderId+" not sent (" + e.message + "), trying next.");
+                            notSent.push(href.href + ": " + e.message);
                         }else{
                             // TODO....
                             if(e.code == "ERR_BAD_REQUEST"){
@@ -2539,6 +2609,7 @@ export class NmosRegistryConnector {
                     }
                 }
             }
+            SyncLog.log("error", "nmos", "Sender " + senderId + ": no control address took the PATCH." + (notSent.length ? " " + notSent.join("; ") : ""), {controlHrefs, patch});
         }catch(e){
 
         }
@@ -2585,17 +2656,19 @@ export class NmosRegistryConnector {
                 }
             };
 
+            let notSent:string[] = [];
             for(let href of controlHrefs){
                 let fixSlash = (href.href[href.href.length-1] == "/") ? "" : "/";
                 let patchHref = href.href + fixSlash + "single/receivers/" + receiverId + "/staged";
                 try{
-                    let result = await deviceRequest(deviceQueueKey(device, patchHref), {method:"patch", url:patchHref, data:patch, timeout:30000});
+                    let result = await deviceRequest(deviceQueueKey(device, patchHref), {method:"patch", url:patchHref, data:patch, timeout:30000}, {idempotent:true});
                     SyncLog.log("success", "nmos", "Successfully " + (disable?"disabled":"enabled") + " receiver: " + receiverId, {href:patchHref, data:patch, status:result?.status, response:result?.data});
                     return;
                 }catch(e:any){
                     if(axios.isAxiosError(e)){
                         if(neverConnected(e)){
-                            SyncLog.log("info", "nmos", "Patch on " + receiverId + " did not connect (" + e.code + "), trying next.");
+                            SyncLog.log("info", "nmos", "Patch on " + receiverId + " not sent (" + e.message + "), trying next.");
+                            notSent.push(href.href + ": " + e.message);
                         }else{
                             let logBody:any = {controlHrefs, failedControl:patchHref, patch, status:e.response?.status};
                             if(e.response){
@@ -2612,6 +2685,7 @@ export class NmosRegistryConnector {
                     }
                 }
             }
+            SyncLog.log("error", "nmos", "Receiver " + receiverId + ": no control address took the PATCH." + (notSent.length ? " " + notSent.join("; ") : ""), {controlHrefs, patch});
         }catch(e){}
     }
 
@@ -2830,6 +2904,7 @@ export class NmosRegistryConnector {
 
             
 
+            let notSent:string[] = [];
             for(let href of controlHrefs){
                 // TODO, version specific things
                 let fixSlash = ""
@@ -2840,7 +2915,7 @@ export class NmosRegistryConnector {
                 }
                 let patchHref = href.href + fixSlash + "single/senders/" + senderId + "/staged";
                 try{
-                    let result = await deviceRequest(deviceQueueKey(device, patchHref), {method:"patch", url:patchHref, data:patch, timeout:30000});
+                    let result = await deviceRequest(deviceQueueKey(device, patchHref), {method:"patch", url:patchHref, data:patch, timeout:30000}, {idempotent:true});
                     SyncLog.log("success", "nmos", "Successfully set multicast: "+senderId, {href:patchHref, data:patch, status:result?.status, response:result?.data});
 
 
@@ -2878,7 +2953,8 @@ export class NmosRegistryConnector {
                     if (axios.isAxiosError(e)) {
                         if(neverConnected(e)){
                             // NEXT
-                            SyncLog.log("info", "nmos", "Patch on "+senderId+" did not connect (" + e.code + "), trying next.");
+                            SyncLog.log("info", "nmos", "Patch on "+senderId+" not sent (" + e.message + "), trying next.");
+                            notSent.push(href.href + ": " + e.message);
                         }else{
                             // TODO....
                             if(e.code == "ERR_BAD_REQUEST"){
@@ -2893,6 +2969,7 @@ export class NmosRegistryConnector {
                     }
                 }
             }
+            SyncLog.log("error", "nmos", "Sender " + senderId + ": no control address took the PATCH." + (notSent.length ? " " + notSent.join("; ") : ""), {controlHrefs, patch});
         }catch(e){
 
         }
@@ -2935,7 +3012,7 @@ export class NmosRegistryConnector {
                         if(href[href.length-1] !== "/"){ href += "/"; }
                         href += "single/senders/" + senderId + "/active/";
                         try{
-                            let response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000}, true);
+                            let response = await deviceRequest(deviceQueueKey(device, href), {method:"get", url:href, timeout:5000}, {background:true});
                             this.nmosState.senderActiveData[senderId] = response.data;
                             return true;
                         }catch(e:any){

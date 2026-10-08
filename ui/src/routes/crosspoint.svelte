@@ -1496,6 +1496,7 @@
     
     function showConnectResponse(data:any){
       let result:any = {success:0, disconnect:0, failed:0, reasons:[], failedNames:[], log:"ids"}
+      let failedIds:string[] = [];
       data.connections.forEach((c:any)=>{
         if(c.status == "ok"){
           result.success ++;
@@ -1508,9 +1509,9 @@
           // count alone does not say which of them still need a look. A
           // rejection without detail ("failed sender info") must not throw
           // here — that dropped the whole toast.
-          let name = c.dst ? (c.dst.alias || c.dst.name || c.dst.id) : "";
-          if(name && !result.failedNames.includes(name)){
-            result.failedNames.push(name);
+          if(c.dst && !failedIds.includes(c.dst.id)){
+            failedIds.push(c.dst.id);
+            result.failedNames.push(c.dst.alias || c.dst.name || c.dst.id);
           }
 
           let reason = c.detail?.message || c.status || "failed";
@@ -1525,6 +1526,9 @@
         }
         
       })
+      if(result.failedNames.length > 10){
+        result.failedNames = result.failedNames.slice(0, 10).concat(["… and " + (result.failedNames.length - 10) + " more"]);
+      }
       let feedback:any ={ level:"neutral",
         time:7000,
         message:"Connection Feedback",

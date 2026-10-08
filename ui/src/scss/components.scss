@@ -149,6 +149,12 @@ label svg { width:20px;}
             }
             .alert-detail {
                 font-size: 14px;
+                // The toast does not wrap (daisyUI: white-space nowrap) and
+                // grows to the left; a long list of receiver names pushed
+                // the title off screen.
+                white-space: normal;
+                overflow-wrap: anywhere;
+                max-width: min(40rem, calc(100vw - 160px));
             }
         }
     }
