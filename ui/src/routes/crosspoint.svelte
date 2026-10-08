@@ -1495,7 +1495,7 @@
 
     
     function showConnectResponse(data:any){
-      let result:any = {success:0, disconnect:0, failed:0, reasons:[], log:"ids"}
+      let result:any = {success:0, disconnect:0, failed:0, reasons:[], failedNames:[], log:"ids"}
       data.connections.forEach((c:any)=>{
         if(c.status == "ok"){
           result.success ++;
@@ -1504,11 +1504,21 @@
         }else{
           result.failed ++;
 
-          if(!result.reasons.includes(c.detail.message)){
-            result.reasons.push(c.detail.message);
+          // Which receivers, not only why: after a device-level take the
+          // count alone does not say which of them still need a look. A
+          // rejection without detail ("failed sender info") must not throw
+          // here — that dropped the whole toast.
+          let name = c.dst ? (c.dst.alias || c.dst.name || c.dst.id) : "";
+          if(name && !result.failedNames.includes(name)){
+            result.failedNames.push(name);
           }
 
-          if(c.detail.log != ""){
+          let reason = c.detail?.message || c.status || "failed";
+          if(!result.reasons.includes(reason)){
+            result.reasons.push(reason);
+          }
+
+          if(c.detail?.log){
             result.log += "||" + c.detail.log
           }
 

@@ -124,6 +124,9 @@ function doLogin(){
                     {/if}
                     {#if feedback.data.result.failed }
                         <span class="alert-text text-error">Flows failed: {feedback.data.result.failed}</span>
+                        {#if feedback.data.result.failedNames?.length }
+                            <span class="alert-detail">{feedback.data.result.failedNames.join(", ")}</span>
+                        {/if}
                         <span class="alert-detail">
                             {#each feedback.data.result.reasons as r}
                             {r} 
