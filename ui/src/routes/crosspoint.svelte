@@ -1074,11 +1074,72 @@
     //    only the pairs: the cell lights up for any such connection (one
     //    camera on two multiviewer tiles), and a lit cell has to go dark.
     // Returns the entries to disconnect, or null when the click connects.
-    function cellOffTargets(list:any[], srcIds:Set<string>):any[]|null{
+    // `connectedOf` defaults to effectiveConnectedFlow; the repaint passes
+    // the same answer from maps (partialDeviceCells).
+    function cellOffTargets(list:any[], srcIds:Set<string>, connectedOf:(dst:any)=>string = effectiveConnectedFlow):any[]|null{
       let pairs = list.filter((n:any)=> n.src && n.dst && n.src.available !== false && n.dst.available !== false);
-      let allActive = pairs.length > 0 && pairs.every((n:any)=> effectiveConnectedFlow(n.dst) === n.src.id);
+      let allActive = pairs.length > 0 && pairs.every((n:any)=> connectedOf(n.dst) === n.src.id);
       if(!allActive){ return null; }
-      return list.filter((n:any)=> n.dst && n.dst.available !== false && srcIds.has(effectiveConnectedFlow(n.dst)));
+      return list.filter((n:any)=> n.dst && n.dst.available !== false && srcIds.has(connectedOf(n.dst)));
+    }
+
+    // id -> {flow, dev} over the WHOLE state, hidden and filtered flows
+    // included, to turn the matcher's id pairs back into flows.
+    // Also: devices by number (for the matcher) and every sender id per
+    // device (what sourceIdsOf answers for a device cell).
+    function stateFlowIndex(){
+      const idx = {
+        senders: new Map<string,{flow:any,dev:any}>(),
+        receivers: new Map<string,{flow:any,dev:any}>(),
+        byNum: new Map<string,any[]>(),
+        senderIdsByDev: new Map<string,Set<string>>()
+      };
+      const devs:any[] = (sourceState && Array.isArray(sourceState.devices)) ? sourceState.devices : [];
+      for(const d of devs){
+        let n = "" + d.num;
+        if(!idx.byNum.has(n)){ idx.byNum.set(n, []); }
+        idx.byNum.get(n)!.push(d);
+        let ids = new Set<string>();
+        for(const t in (d.senders || {})){ for(const f of (d.senders[t] || [])){ idx.senders.set(f.id, { flow: f, dev: d }); ids.add(f.id); } }
+        for(const t in (d.receivers || {})){ for(const f of (d.receivers[t] || [])){ idx.receivers.set(f.id, { flow: f, dev: d }); } }
+        idx.senderIdsByDev.set(d.id, ids);
+      }
+      return idx;
+    }
+
+    // The device pairs among `lit` (keys "srcDevId|dstDevId") that are only
+    // partly routed: some connection runs, but not every pair a click would
+    // make, so a click connects instead of switching off. Same decision as
+    // the click (cellOffTargets), but every lookup goes through maps built
+    // once here — this runs on every repaint, hover and sync frames
+    // included, and the per-entry scans of the click path made it quadratic
+    // in the size of the plant.
+    function partialDeviceCells(lit:Array<{key:string,sDev:any,rDev:any}>, liveReceivers:Map<string,{flow:any,dev:any}>):Set<string>{
+      const out = new Set<string>();
+      if(lit.length === 0){ return out; }
+      const idx = stateFlowIndex();
+      // effectiveConnectedFlow, answered from maps: the last in-flight take
+      // per receiver wins, then the visible flow, then the state's copy.
+      const working = new Map<string,string>();
+      for(const c of workingConnectList){ if(c && c.dst){ working.set(c.dst.id, c.src ? c.src.id : ""); } }
+      const connectedOf = (dst:any):string =>
+        working.has(dst.id) ? (working.get(dst.id) as string) : (((liveReceivers.get(dst.id)?.flow) || dst).connectedFlow || "");
+      for(const p of lit){
+        const list = computePreviewConnections(getDevcieNameString(p.sDev, null), getDevcieNameString(p.rDev, null), idx.byNum);
+        const srcIds = idx.senderIdsByDev.get(p.sDev.id) || sourceIdsOf(p.sDev, null);
+        if(cellOffTargets(pairsAsFlows(list, idx), srcIds, connectedOf) === null){ out.add(p.key); }
+      }
+      return out;
+    }
+
+    // The matcher's {src, dst} id pairs (computePreviewConnections) as
+    // flow objects — the shape cellOffTargets reads.
+    function pairsAsFlows(list:any[], idx:ReturnType<typeof stateFlowIndex>):any[]{
+      return list.map((e:any)=>{
+        let s = e.src ? idx.senders.get(e.src) : null;
+        let r = idx.receivers.get(e.dst);
+        return { src: s ? s.flow : null, dst: r ? r.flow : null, dstDev: r ? r.dev : null };
+      });
     }
 
     function findReceiverFlowById(id:string):any{
@@ -1108,21 +1169,7 @@
 
       let next = computePreviewConnections(srcString, dstString);
       // A click on a switched cell turns it OFF — preview exactly that.
-      let flowIn = (kind:string, id:string)=>{
-        let devs:any[] = (sourceState && Array.isArray(sourceState.devices)) ? sourceState.devices : [];
-        for(const d of devs){
-          for(const t in (d[kind] || {})){
-            for(const f of (d[kind][t] || [])){ if(f.id === id){ return { dev: d, flow: f }; } }
-          }
-        }
-        return null;
-      };
-      let asObjects = next.map((e:any)=>{
-        let s = e.src ? flowIn("senders", e.src) : null;
-        let r = flowIn("receivers", e.dst);
-        return { src: s ? s.flow : null, dst: r ? r.flow : null, dstDev: r ? r.dev : null };
-      });
-      let off = cellOffTargets(asObjects, sourceIdsOf(srcDev, src));
+      let off = cellOffTargets(pairsAsFlows(next, stateFlowIndex()), sourceIdsOf(srcDev, src));
       if(off){ next = off.map((n:any)=>({ src: null, dst: n.dst.id })); }
       // Same preview as before (hovering along the same row/column) — skip
       // the full matrix repaint entirely. Element-wise compare instead of
@@ -1146,7 +1193,9 @@
      * exactly what TAKE (which runs the server version) will do, so any
      * change to the matcher has to land in BOTH places.
      */
-    function computePreviewConnections(source:string, destination:string):any[]{
+    // `byNum` (from stateFlowIndex) only speeds up finding the devices by
+    // number — the selection itself is the same as without it.
+    function computePreviewConnections(source:string, destination:string, byNum?:Map<string,any[]>):any[]{
       let out:any[] = [];
       let devices:any[] = (sourceState && Array.isArray(sourceState.devices)) ? sourceState.devices : [];
       let disconnect = (source == "" || source == "__disconnect");
@@ -1172,7 +1221,7 @@
       let d = parseSel(destination);
 
       let srcFlows:any[] = [];
-      for(let dev of devices){
+      for(let dev of (byNum ? (byNum.get("" + s.deviceNum) || []) : devices)){
         if(dev.num == s.deviceNum){
           for(let type in dev.senders){
             if(type == s.flowType || s.deviceOnly){
@@ -1185,7 +1234,7 @@
       }
 
       let dstFlows:any[] = [];
-      for(let dev of devices){
+      for(let dev of (byNum ? (byNum.get("" + d.deviceNum) || []) : devices)){
         if(dev.num == d.deviceNum){
           for(let type in dev.receivers){
             if(type == d.flowType || d.deviceOnly){
@@ -1350,7 +1399,7 @@
       // EVERY active connection between the two devices is staged for
       // disconnect; health = solid fill in the WORST status of any
       // connection between the two devices (red beats orange beats green).
-      const devAgg: Map<string,{anyUnstaged:boolean,sawPrepared:boolean,sawWorking:boolean,healths:number[],sawUnmon:boolean}> = new Map();
+      const devAgg: Map<string,{anyUnstaged:boolean,sawPrepared:boolean,sawWorking:boolean,healths:number[],sawUnmon:boolean,sDev:any,rDev:any}> = new Map();
 
       // 1) ACTIVE connections — walk the receivers once.
       for(const [rid, rE] of receiverByFlowId){
@@ -1373,17 +1422,32 @@
 
         const k = sE.dev.id + "|" + rE.dev.id;
         let a = devAgg.get(k);
-        if(!a){ a = {anyUnstaged:false, sawPrepared:false, sawWorking:false, healths:[], sawUnmon:false}; devAgg.set(k, a); }
+        if(!a){ a = {anyUnstaged:false, sawPrepared:false, sawWorking:false, healths:[], sawUnmon:false, sDev:sE.dev, rDev:rE.dev}; devAgg.set(k, a); }
         a.healths.push(h);
         if(unmon){ a.sawUnmon = true; }
         if(discPrepared.has(rid)){ a.sawPrepared = true; }
         else if(discWorking.has(rid)){ a.sawWorking = true; }
         else { a.anyUnstaged = true; }
       }
+      // Partially routed: some connection runs between the two devices, but
+      // not every pair a click on the cell would make. The dot then looks
+      // half filled — and a click CONNECTS the rest instead of switching
+      // off (same decision as the click itself, cellOffTargets). Folded
+      // node cells stand for many devices and only unfold on a click, so
+      // they keep the plain look. The index is built only when needed.
+      const lit: Array<{key:string,sDev:any,rDev:any}> = [];
+      for(const [k, a] of devAgg){
+        let staged = !a.anyUnstaged && (a.sawPrepared || a.sawWorking);
+        if(!staged && !a.sDev?.isNode && !a.rDev?.isNode){ lit.push({ key: k, sDev: a.sDev, rDev: a.rDev }); }
+      }
+      const partial = partialDeviceCells(lit, receiverByFlowId);
       for(const [k, a] of devAgg){
         let cls = "active";
-        if(!a.anyUnstaged && (a.sawPrepared || a.sawWorking)){
+        let staged = !a.anyUnstaged && (a.sawPrepared || a.sawWorking);
+        if(staged){
           cls += a.sawPrepared ? " cp-disc-prepared" : " cp-disc-working";
+        }else if(partial.has(k)){
+          cls += " cp-partial";
         }
         // Worst status wins and FILLS the dot: one unhealthy connection
         // among many healthy ones must be as loud as a uniformly bad pair.
@@ -1431,7 +1495,8 @@
 
     
     function showConnectResponse(data:any){
-      let result:any = {success:0, disconnect:0, failed:0, reasons:[], log:"ids"}
+      let result:any = {success:0, disconnect:0, failed:0, reasons:[], failedNames:[], log:"ids"}
+      let failedIds:string[] = [];
       data.connections.forEach((c:any)=>{
         if(c.status == "ok"){
           result.success ++;
@@ -1440,17 +1505,30 @@
         }else{
           result.failed ++;
 
-          if(!result.reasons.includes(c.detail.message)){
-            result.reasons.push(c.detail.message);
+          // Which receivers, not only why: after a device-level take the
+          // count alone does not say which of them still need a look. A
+          // rejection without detail ("failed sender info") must not throw
+          // here — that dropped the whole toast.
+          if(c.dst && !failedIds.includes(c.dst.id)){
+            failedIds.push(c.dst.id);
+            result.failedNames.push(c.dst.alias || c.dst.name || c.dst.id);
           }
 
-          if(c.detail.log != ""){
+          let reason = c.detail?.message || c.status || "failed";
+          if(!result.reasons.includes(reason)){
+            result.reasons.push(reason);
+          }
+
+          if(c.detail?.log){
             result.log += "||" + c.detail.log
           }
 
         }
         
       })
+      if(result.failedNames.length > 10){
+        result.failedNames = result.failedNames.slice(0, 10).concat(["… and " + (result.failedNames.length - 10) + " more"]);
+      }
       let feedback:any ={ level:"neutral",
         time:7000,
         message:"Connection Feedback",

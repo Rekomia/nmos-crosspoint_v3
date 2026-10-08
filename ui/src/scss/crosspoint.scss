@@ -1298,6 +1298,7 @@ $cp-border: 1px solid transparent;
             span {
                 &.active {
                     background-color: $cp-color-green;
+                    --cp-dot: #{$cp-color-green};
                     top: ($cp-sizePP - 16px) * 0.5;
                     left: ($cp-sizePP - 16px) * 0.5;
                     border-radius: 8px;
@@ -1312,12 +1313,27 @@ $cp-border: 1px solid transparent;
                 // pin the dot to green.
                 &.active.cp-health-warn {
                     background-color: $cp-color-warn;
+                    --cp-dot: #{$cp-color-warn};
                 }
                 &.active.cp-health-err {
                     background-color: $cp-color-red;
+                    --cp-dot: #{$cp-color-red};
                 }
                 &.active.cp-health-none {
                     background-color: $cp-color-unmonitored;
+                    --cp-dot: #{$cp-color-unmonitored};
+                }
+
+                // Partially routed: half filled, ring in the same colour —
+                // the empty half is what a click would still connect. Keeps
+                // the health colour (--cp-dot) and stays apart from the
+                // dashed staged / grey working looks. Anchored to the border
+                // box: on hover the dot gains a dashed border, and a
+                // padding-box gradient would tile into it and paint the edge
+                // of the empty half.
+                &.active.cp-partial {
+                    background: linear-gradient(90deg, var(--cp-dot) 50%, transparent 50%) border-box;
+                    box-shadow: inset 0 0 0 2px var(--cp-dot);
                 }
 
                 &:hover {
@@ -1532,6 +1548,13 @@ html[data-theme="light"] {
                     }
                     &.active.cp-health-none {
                         background-color: $cp-color-unmonitored;
+                    }
+                    // Same half-filled look; repeated here because the
+                    // theme-scoped `span.active` above out-ranks the default
+                    // block and would fill the empty half green.
+                    &.active.cp-partial {
+                        background: linear-gradient(90deg, var(--cp-dot) 50%, transparent 50%) border-box;
+                        box-shadow: inset 0 0 0 2px var(--cp-dot);
                     }
                 }
             }
