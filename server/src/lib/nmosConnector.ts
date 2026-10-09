@@ -884,6 +884,7 @@ export class NmosRegistryConnector {
         }
         this.connections = {};
         this.nmosRegistryList = [];
+        this.clearPendingRemovals();
         // The next registry is a different implementation as far as we know —
         // probe its downgrade support again instead of carrying over a "no".
         this.downgradeUnsupported.clear();
@@ -1019,6 +1020,96 @@ export class NmosRegistryConnector {
         }
     }
 
+    // ----- Removal grace -----
+    // A device can drop its whole node from the registry and register it
+    // again a moment later, same ids — the likely reason a Blackmagic DeckLink
+    // IP 100G's devices left the matrix for a second on its first take.
+    // Removals used to take effect at once while the re-add waited for the
+    // 1 s new-item debounce, so every device of that node vanished for about
+    // a second. A removal now takes effect only when the
+    // resource is still gone after REMOVAL_GRACE_MS; a post within that time
+    // cancels it. A device that is really gone shows offline that much later
+    // — the registry itself already waits out a missed heartbeat (12 s by
+    // default) before it removes one.
+    private static REMOVAL_GRACE_MS = 3000;
+    private pendingRemovals: Map<string, any> = new Map();
+    private deferRemoval(type:string, id:string){
+        const key = type + "/" + id;
+        // A repeated removal keeps the first deadline.
+        if(this.pendingRemovals.has(key)) return;
+        const myGen = this.registryGen;
+        this.pendingRemovals.set(key, setTimeout(()=>{
+            this.pendingRemovals.delete(key);
+            if(myGen !== this.registryGen) return;
+            this.finishRemoval(type, id);
+        }, NmosRegistryConnector.REMOVAL_GRACE_MS));
+    }
+    private cancelRemoval(type:string, id:string){
+        const key = type + "/" + id;
+        const timer = this.pendingRemovals.get(key);
+        if(timer === undefined) return;
+        clearTimeout(timer);
+        this.pendingRemovals.delete(key);
+        this.noteReRegistered(type, id);
+    }
+    private clearPendingRemovals(){
+        this.pendingRemovals.forEach((timer)=>{ clearTimeout(timer); });
+        this.pendingRemovals.clear();
+    }
+    private finishRemoval(type:string, id:string){
+        if(!this.nmosState[type] || !this.nmosState[type][id]) return;
+        delete this.nmosState[type][id];
+        // DNS Push: a node that's gone from the registry should not keep a
+        // stale DNS entry.
+        if(type === "nodes"){
+            try{
+                if(DdnsService.instance){
+                    DdnsService.instance.removeNode(id).catch(()=>{});
+                }
+            }catch(e){}
+        }
+        if(type === "senders"){
+            const fetchTimer = this.manifestFetchTimers.get(id);
+            if(fetchTimer){
+                clearTimeout(fetchTimer);
+                this.manifestFetchTimers.delete(id);
+            }
+            delete this.nmosState.sendersManifestDetail[id];
+            delete this.nmosState.senderActiveData[id];
+        }
+        this.scheduleSyncNmos();
+        this.updateCrosspoint();
+    }
+
+    // One log line per burst, so a device that re-registers is visible in
+    // the log instead of silently kept online.
+    private reRegisteredCount: Map<string, number> = new Map();
+    private reRegisteredNames: Set<string> = new Set();
+    private reRegisteredLogTimer: any = null;
+    private noteReRegistered(type:string, id:string){
+        this.reRegisteredCount.set(type, (this.reRegisteredCount.get(type) || 0) + 1);
+        try{
+            const res:any = this.nmosState[type]?.[id];
+            const devLabel = (type === "nodes" || type === "devices")
+                ? res?.label
+                : (this.nmosState.devices as any)?.[res?.device_id]?.label;
+            if(devLabel && this.reRegisteredNames.size < 20){ this.reRegisteredNames.add(devLabel); }
+        }catch(e){}
+        if(this.reRegisteredLogTimer) return;
+        this.reRegisteredLogTimer = setTimeout(()=>{
+            this.reRegisteredLogTimer = null;
+            const counts:any = {};
+            let total = 0;
+            this.reRegisteredCount.forEach((n, t)=>{ counts[t] = n; total += n; });
+            const names = Array.from(this.reRegisteredNames);
+            this.reRegisteredCount.clear();
+            this.reRegisteredNames.clear();
+            SyncLog.log("info", "NMOS", "Registry removed " + total + " resource(s) and registered them again within " +
+                (NmosRegistryConnector.REMOVAL_GRACE_MS / 1000) + " s" + (names.length ? " (" + names.join(", ") + ")" : "") +
+                " — kept online instead of showing them offline.", { counts, names });
+        }, 2000);
+    }
+
     updateNewNmosItemTimer:any|null = null;
     private updateState(message: any, version:string, registryUrl:string = "") {
         //console.log("updates from registry: " + message.type)
@@ -1037,6 +1128,9 @@ export class NmosRegistryConnector {
                     if (g.hasOwnProperty("post")) {
                         // add or update element
                         if (typeof g.post == "object") {
+                            // Back inside the removal grace: the entry never
+                            // left, so this is an update, not a new item.
+                            this.cancelRemoval(type, g.path);
                             if(this.nmosState[type][g.path] && !this.versionIsPrefered(this.nmosState[type][g.path]["_sourceVersion"], version)){
                                 // do not update
                             }else{
@@ -1109,19 +1203,10 @@ export class NmosRegistryConnector {
                         // version than the one that added the entry. Requiring a
                         // match meant such removals were dropped on the floor and
                         // the resource stayed "online" in the crosspoint forever.
+                        // Takes effect after REMOVAL_GRACE_MS, see deferRemoval.
                         try {
                             if(this.nmosState[type][g.path]){
-                                delete this.nmosState[type][g.path];
-                                // DNS Push: a node that's gone from the
-                                // registry should not keep a stale DNS entry.
-                                if(type === "nodes"){
-                                    try{
-                                        if(DdnsService.instance){
-                                            DdnsService.instance.removeNode(g.path).catch(()=>{});
-                                        }
-                                    }catch(e){}
-                                }
-                                changes = true;
+                                this.deferRemoval(type, g.path);
                             }
                         } catch (e) {}
                     }
@@ -1152,7 +1237,9 @@ export class NmosRegistryConnector {
 
         
                 message.grain.data.forEach((g: any) => {
-
+                    // A removal is followed up when it takes effect
+                    // (finishRemoval), not when the grain arrives.
+                    if (!g || !g.hasOwnProperty("post")) return;
 
                     if (type == "senders" || type == "flows") {
                         // One fetch per resource, coalesced. Every grain used
