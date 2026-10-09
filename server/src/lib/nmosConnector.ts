@@ -23,6 +23,7 @@ import { CrosspointAbstraction, CrosspointConnectionSenderInfo } from "./crosspo
 import { MulticastLeaseManager } from "./multicastLeaseManager";
 import { DdnsService } from "./ddnsService";
 import { deviceQueueKey, deviceRequest, markUnresponsive, neverConnected, noAnswer, withDevice } from "./deviceHttp";
+import { isReceiving, receiverConnectionOf } from "./receiverConnection";
 
 const fs = require("fs");
 
@@ -431,6 +432,9 @@ export class NmosRegistryConnector {
         flows: {},
         nodes: {},
         senderActiveData:{},
+        // Receivers whose registry entry names no sender: their IS-05
+        // /active as read from the device (see readReceiverConnection).
+        receiverActiveData:{},
         channelmapping:{},
         sendersManifestDetail :{}
     };
@@ -891,10 +895,12 @@ export class NmosRegistryConnector {
         // Reset the in-memory NMOS state so the UI doesn't see stale devices
         // from the previous registry. setState emits a JSON-patch reset to
         // every subscribed client.
+        this.receiverReadTimers.forEach((timer)=>{ clearTimeout(timer); });
+        this.receiverReadTimers.clear();
         this.nmosState = {
             devices: {}, sources: {}, senders: {}, receivers: {},
-            flows: {}, nodes: {}, senderActiveData: {}, channelmapping: {},
-            sendersManifestDetail: {}
+            flows: {}, nodes: {}, senderActiveData: {}, receiverActiveData: {},
+            channelmapping: {}, sendersManifestDetail: {}
         };
         // Cancel any pending coalesced sync and push the empty state right
         // away so the UI clears immediately on a registry switch.
@@ -1077,6 +1083,10 @@ export class NmosRegistryConnector {
             delete this.nmosState.sendersManifestDetail[id];
             delete this.nmosState.senderActiveData[id];
         }
+        if(type === "receivers"){
+            this.cancelReceiverRead(id);
+            delete this.nmosState.receiverActiveData[id];
+        }
         this.scheduleSyncNmos();
         this.updateCrosspoint();
     }
@@ -1258,11 +1268,115 @@ export class NmosRegistryConnector {
                             this.getSenderActive(type, g);
                         },100);
                     }
+
+                    if(type == "receivers"){
+                        // No `pre`: added to the registry just now, not
+                        // part of the snapshot a (re)subscription starts with.
+                        this.receiverChanged(g.path, !g.hasOwnProperty("pre"));
+                    }
                 });
 
 
         
 
+    }
+
+    // ----- Receivers the registry names no sender for -----
+    // A device that keeps receiving across a reboot can come back with no
+    // sender_id in its IS-04 subscription: the picture runs, the matrix shows
+    // nothing. For such a receiver we ask the device itself (IS-05 /active)
+    // and keep the answer in receiverActiveData; the worker works out the
+    // sender from it (receiverConnection.ts). Event driven, no polling: one
+    // read whenever the receiver's registry entry changes.
+    private receiverReadTimers: Map<string, any> = new Map();
+    // A device that just (re)registered may restore its connection a little
+    // later without touching IS-04 — ask again after these delays while it
+    // shows no stream.
+    private static RECEIVER_RETRY_MS = [10000, 30000];
+
+    private receiverChanged(receiverId:string, justRegistered:boolean){
+        let receiver:any = this.nmosState.receivers[receiverId];
+        if(!receiver){ return; }
+        let known:any = this.nmosState.receiverActiveData[receiverId];
+        let sub = receiver.subscription;
+        if(sub && sub.active && sub.sender_id){
+            // The registry names the sender: nothing to work out.
+            this.cancelReceiverRead(receiverId);
+            if(known){
+                delete this.nmosState.receiverActiveData[receiverId];
+                this.scheduleSyncNmos();
+            }
+            return;
+        }
+        // Already read for exactly this state (a re-sync repeats it).
+        if(known && known.is04Version === "" + receiver.version){ return; }
+        if(known){
+            // Stale from here on: nothing rather than an old answer.
+            delete this.nmosState.receiverActiveData[receiverId];
+            this.scheduleSyncNmos();
+            this.updateCrosspoint();
+        }
+        this.scheduleReceiverRead(receiverId, 300, justRegistered ? NmosRegistryConnector.RECEIVER_RETRY_MS : []);
+    }
+
+    private scheduleReceiverRead(receiverId:string, delay:number, retries:number[]){
+        this.cancelReceiverRead(receiverId);
+        this.receiverReadTimers.set(receiverId, setTimeout(()=>{
+            this.receiverReadTimers.delete(receiverId);
+            this.readReceiverConnection(receiverId).then((receiving)=>{
+                // A newer registry change has scheduled its own read.
+                if(receiving || retries.length === 0 || this.receiverReadTimers.has(receiverId)){ return; }
+                this.scheduleReceiverRead(receiverId, retries[0], retries.slice(1));
+            }).catch(()=>{});
+        }, delay));
+    }
+
+    private cancelReceiverRead(receiverId:string){
+        let timer = this.receiverReadTimers.get(receiverId);
+        if(timer !== undefined){
+            clearTimeout(timer);
+            this.receiverReadTimers.delete(receiverId);
+        }
+    }
+
+    /** Reads the receiver's IS-05 /active and stores it. Resolves true when
+     *  the receiver takes a stream (or the registry names its sender by now). */
+    private async readReceiverConnection(receiverId:string):Promise<boolean>{
+        let receiver:any = this.nmosState.receivers[receiverId];
+        if(!receiver){ return false; }
+        let sub = receiver.subscription;
+        if(sub && sub.active && sub.sender_id){ return true; }
+        let device:any = this.nmosState.devices[receiver.device_id];
+        let hrefs:string[] = [];
+        for(let ctrlType of ["urn:x-nmos:control:sr-ctrl/v1.1", "urn:x-nmos:control:sr-ctrl/v1.0"]){
+            for(let c of NmosRegistryConnector.controlsOf(device)){
+                if(c.type === ctrlType && typeof c.href === "string"){ hrefs.push(c.href); }
+            }
+            if(hrefs.length > 0){ break; }
+        }
+        if(hrefs.length === 0){ return false; }
+
+        let version = "" + receiver.version;
+        let active:any = null;
+        for(let href of hrefs){
+            active = await this.readReceiverActiveAt(receiverId, href, device, true);
+            if(active){ break; }
+        }
+        // Changed or gone while we waited: that change brings its own read.
+        let now:any = this.nmosState.receivers[receiverId];
+        if(!now || ("" + now.version) !== version){ return true; }
+        if(!active){ return false; }
+
+        let conn = receiverConnectionOf(active, version);
+        let before:any = this.nmosState.receiverActiveData[receiverId];
+        this.nmosState.receiverActiveData[receiverId] = conn;
+        let same = !!before && before.masterEnable === conn.masterEnable && before.senderId === conn.senderId &&
+                   JSON.stringify(before.legs) === JSON.stringify(conn.legs);
+        if(!same){
+            this.scheduleSyncNmos();
+            this.updateCrosspoint();
+        }
+        return isReceiving(conn);
     }
 
     async loadChannelMaping(postData:any){

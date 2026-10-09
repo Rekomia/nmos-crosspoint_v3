@@ -1,0 +1,223 @@
+/*
+    NMOS Crosspoint
+    Copyright (C) 2021 Johannes Grieb
+*/
+
+import * as sdpTransform from 'sdp-transform';
+
+// ----- What a receiver is connected to, in the device's own words -----
+// The matrix draws a connection from the receiver's IS-04 subscription:
+// active, and the sender it names. Some devices keep receiving after a
+// reboot (they restore their IS-05 transport parameters) but come back with
+// no sender_id in the registry, so the picture runs and the matrix shows
+// nothing. For a receiver whose registry entry names no sender we read its
+// IS-05 /active from the device and work out what it receives:
+//
+//  - master_enable true and a sender_id: connected to that sender (the
+//    registry has not caught up, or the device does not report it there).
+//  - master_enable true, no sender_id, but multicast groups: connected to the
+//    one known sender that sends exactly these (group, port, source). Several
+//    or none: no connection is drawn, the note says what it receives.
+//  - master_enable false: nothing.
+//
+// Nothing here is remembered across restarts: what is shown is what the
+// device says now, so a route made outside the crosspoint shows up as such.
+
+export interface ReceiverLeg {
+    group: string|null,
+    port: number|null,
+    source: string|null,
+    enabled: boolean
+}
+
+export interface ReceiverConnection {
+    // The IS-04 version of the receiver this was read for. A newer version
+    // means the receiver changed since, and the reading is dropped.
+    is04Version: string,
+    readAt: number,
+    masterEnable: boolean,
+    senderId: string|null,
+    legs: ReceiverLeg[]
+}
+
+export interface DerivedConnection {
+    // "device": the device's IS-05 names the sender. "stream": matched by the
+    // multicast it receives. "": receiving, but no single sender matches.
+    via: "device"|"stream"|"",
+    senderId: string,
+    note: string,
+    // Changes whenever what is shown changes — for the log.
+    key: string
+}
+
+const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+/** An IP address from an IS-05 field or an SDP c= line ("239.1.1.1/64"),
+ *  or null for "auto", null, 0.0.0.0 and anything else that names none. */
+export function cleanIp(v:any):string|null{
+    if(typeof v !== "string"){ return null; }
+    let s = v.trim().split(/[\s/]/)[0];
+    if(IPV4.test(s)){
+        return (s === "0.0.0.0") ? null : s;
+    }
+    if(s.includes(":") && /^[0-9a-fA-F:.]+$/.test(s)){
+        return s.toLowerCase();
+    }
+    return null;
+}
+
+export function isMulticast(ip:string|null):boolean{
+    if(!ip){ return false; }
+    let m = IPV4.exec(ip);
+    if(m){
+        let first = Number(m[1]);
+        return first >= 224 && first <= 239;
+    }
+    return ip.startsWith("ff");
+}
+
+function cleanPort(v:any):number|null{
+    return (typeof v === "number" && v > 0) ? v : null;
+}
+
+function sdpMedia(sdp:any, index:number):{ group:string|null, port:number|null, source:string|null }{
+    let m = sdp && Array.isArray(sdp.media) ? sdp.media[index] : null;
+    if(!m){ return { group: null, port: null, source: null }; }
+    let group = cleanIp(m.connection?.ip ?? sdp.connection?.ip);
+    let source = cleanIp(m.sourceFilter?.srcList ?? sdp.sourceFilter?.srcList);
+    return {
+        group: isMulticast(group) ? group : null,
+        port: cleanPort(m.port),
+        source
+    };
+}
+
+/** The receiver's IS-05 /active, boiled down to what matching needs. Each
+ *  leg takes its values from transport_params; the transport file only fills
+ *  what they leave open ("auto", null). */
+export function receiverConnectionOf(active:any, is04Version:string, now = Date.now()):ReceiverConnection{
+    let tps:any[] = (active && Array.isArray(active.transport_params)) ? active.transport_params : [];
+    let sdp:any = null;
+    try{
+        let data = active?.transport_file?.data;
+        if(typeof data === "string" && data.length > 10){ sdp = sdpTransform.parse(data); }
+    }catch(e){ sdp = null; }
+    let count = tps.length > 0 ? tps.length : (sdp && Array.isArray(sdp.media) ? sdp.media.length : 0);
+    let legs:ReceiverLeg[] = [];
+    for(let i = 0; i < count; i++){
+        let tp = tps[i] || {};
+        let fromSdp = sdpMedia(sdp, i);
+        let group = cleanIp(tp.multicast_ip);
+        if(!isMulticast(group)){ group = fromSdp.group; }
+        legs.push({
+            group,
+            port: cleanPort(tp.destination_port) ?? fromSdp.port,
+            source: cleanIp(tp.source_ip) ?? fromSdp.source,
+            enabled: tp.rtp_enabled !== false
+        });
+    }
+    return {
+        is04Version: "" + (is04Version ?? ""),
+        readAt: now,
+        masterEnable: !!(active && active.master_enable === true),
+        senderId: (active && typeof active.sender_id === "string" && active.sender_id) ? active.sender_id : null,
+        legs
+    };
+}
+
+/** Whether the reading shows the receiver taking a stream at all. */
+export function isReceiving(conn:ReceiverConnection|null|undefined):boolean{
+    return !!conn && conn.masterEnable && (!!conn.senderId || conn.legs.some((l) => l.enabled && !!l.group));
+}
+
+export interface SenderStream {
+    senderId: string,
+    port: number|null,
+    source: string|null,
+    active: boolean
+}
+
+/** Every known sender's multicast legs, by group. From the sender's IS-05
+ *  /active where we have it, from its SDP otherwise. */
+export function senderStreamIndex(nmosState:any):Map<string, SenderStream[]>{
+    let index:Map<string, SenderStream[]> = new Map();
+    let senders = nmosState?.senders || {};
+    for(let senderId of Object.keys(senders)){
+        let s = senders[senderId];
+        let act = nmosState.senderActiveData?.[senderId];
+        let active = (act && typeof act.master_enable === "boolean") ? act.master_enable : !!s?.subscription?.active;
+        let legs:Array<{ group:string|null, port:number|null, source:string|null }> = [];
+        if(act && Array.isArray(act.transport_params)){
+            for(let tp of act.transport_params){
+                if(!tp || tp.rtp_enabled === false){ continue; }
+                let group = cleanIp(tp.destination_ip);
+                legs.push({ group: isMulticast(group) ? group : null, port: cleanPort(tp.destination_port), source: cleanIp(tp.source_ip) });
+            }
+        }else{
+            let sdp = nmosState.sendersManifestDetail?.[senderId];
+            let n = (sdp && Array.isArray(sdp.media)) ? sdp.media.length : 0;
+            for(let i = 0; i < n; i++){ legs.push(sdpMedia(sdp, i)); }
+        }
+        for(let leg of legs){
+            if(!leg.group){ continue; }
+            if(!index.has(leg.group)){ index.set(leg.group, []); }
+            index.get(leg.group)!.push({ senderId, port: leg.port, source: leg.source, active });
+        }
+    }
+    return index;
+}
+
+/** What to show for a receiver whose registry entry names no sender. */
+export function deriveReceiverConnection(conn:ReceiverConnection|null|undefined, streams:Map<string, SenderStream[]>,
+                                         labelOf:(senderId:string) => string = (id) => id):DerivedConnection|null{
+    if(!conn || !conn.masterEnable){ return null; }
+    if(conn.senderId){
+        return {
+            via: "device",
+            senderId: conn.senderId,
+            note: "Read from the device: the registry does not name the sender.",
+            key: "device:" + conn.senderId
+        };
+    }
+    let legs = conn.legs.filter((l) => l.enabled && !!l.group);
+    if(legs.length === 0){ return null; }
+    let where = legs.map((l) => l.group + (l.port !== null ? ":" + l.port : "")).join(" + ");
+
+    // A sender matches when it sends every leg the receiver takes.
+    let candidates:Set<string>|null = null;
+    let activeOf:Map<string, boolean> = new Map();
+    for(let leg of legs){
+        let ids:Set<string> = new Set();
+        for(let e of streams.get(leg.group as string) || []){
+            if(leg.port !== null && e.port !== null && e.port !== leg.port){ continue; }
+            if(leg.source && e.source && e.source !== leg.source){ continue; }
+            ids.add(e.senderId);
+            activeOf.set(e.senderId, e.active || !!activeOf.get(e.senderId));
+        }
+        candidates = (candidates === null) ? ids : new Set(Array.from(candidates).filter((id) => ids.has(id)));
+    }
+    let list = Array.from(candidates || []);
+    // Two senders on one group: only one of them can be on the wire.
+    if(list.length > 1){
+        let on = list.filter((id) => activeOf.get(id));
+        if(on.length === 1){ list = on; }
+    }
+    if(list.length === 1){
+        return {
+            via: "stream",
+            senderId: list[0],
+            note: "Matched by stream " + where + ": the device does not name its sender.",
+            key: "stream:" + list[0] + "@" + where
+        };
+    }
+    if(list.length === 0){
+        return { via: "", senderId: "", note: "Receives " + where + ": no known sender sends this.", key: "unknown@" + where };
+    }
+    let names = list.slice(0, 5).map((id) => "\"" + labelOf(id) + "\"").join(", ") + (list.length > 5 ? ", …" : "");
+    return {
+        via: "",
+        senderId: "",
+        note: "Receives " + where + ": sent by " + list.length + " senders (" + names + ").",
+        key: "ambiguous@" + where + ":" + list.sort().join(",")
+    };
+}

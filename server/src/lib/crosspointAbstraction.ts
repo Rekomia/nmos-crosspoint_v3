@@ -1003,6 +1003,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                 receivers: s.receivers,
                 flows: s.flows,
                 senderActiveData: s.senderActiveData,
+                receiverActiveData: s.receiverActiveData,
                 sendersManifestDetail: s.sendersManifestDetail,
             } : s;
             this.workerNeedsNmosState = false;
@@ -1872,6 +1873,14 @@ export interface CrosspointFlow {
     // "← <Device> / <Sender>" without a second lookup).
     connectedSenderId?:string,
     connectedSenderLabel?:string,
+    // Receiver-only: where connectedFlow comes from. "registry": the IS-04
+    // subscription names the sender. "device": the device's IS-05 /active
+    // does, the registry does not. "stream": nobody names it — matched by
+    // the multicast the receiver takes (see receiverConnection.ts).
+    connectedVia?:"registry"|"device"|"stream",
+    // Receiver-only: why a connection is shown that the registry does not
+    // name, or what the receiver takes when no single sender matches.
+    connectionNote?:string,
     // True when this sender lives on our own virtual NMOS device. The
     // Details page uses this to hide leg / multicast edit controls that
     // would be rejected (IS-05 PATCH returns 405 on virtual senders).

@@ -1399,7 +1399,7 @@
       // EVERY active connection between the two devices is staged for
       // disconnect; health = solid fill in the WORST status of any
       // connection between the two devices (red beats orange beats green).
-      const devAgg: Map<string,{anyUnstaged:boolean,sawPrepared:boolean,sawWorking:boolean,healths:number[],sawUnmon:boolean,sDev:any,rDev:any}> = new Map();
+      const devAgg: Map<string,{anyUnstaged:boolean,sawPrepared:boolean,sawWorking:boolean,healths:number[],sawUnmon:boolean,allDerived:boolean,sDev:any,rDev:any}> = new Map();
 
       // 1) ACTIVE connections — walk the receivers once.
       for(const [rid, rE] of receiverByFlowId){
@@ -1412,7 +1412,12 @@
         // BCP-008 monitor. Light blue then — it is not a fault, it is a blind
         // spot, and a real fault still outranks it.
         const unmon = bcp008On && (!sE.flow.monitor || !rE.flow.monitor);
+        // Nobody names the sender — not the registry, not the device: the
+        // server matched it by the stream the receiver takes. A ring instead
+        // of a fill, so it reads as "worked out", not "reported".
+        const derived = rE.flow.connectedVia === "stream";
         let cls = "active";
+        if(derived){ cls += " cp-derived"; }
         if(discPrepared.has(rid)){ cls += " cp-disc-prepared"; }
         else if(discWorking.has(rid)){ cls += " cp-disc-working"; }
         if(h === 3){ cls += " cp-health-err"; }
@@ -1422,7 +1427,8 @@
 
         const k = sE.dev.id + "|" + rE.dev.id;
         let a = devAgg.get(k);
-        if(!a){ a = {anyUnstaged:false, sawPrepared:false, sawWorking:false, healths:[], sawUnmon:false, sDev:sE.dev, rDev:rE.dev}; devAgg.set(k, a); }
+        if(!a){ a = {anyUnstaged:false, sawPrepared:false, sawWorking:false, healths:[], sawUnmon:false, allDerived:true, sDev:sE.dev, rDev:rE.dev}; devAgg.set(k, a); }
+        if(!derived){ a.allDerived = false; }
         a.healths.push(h);
         if(unmon){ a.sawUnmon = true; }
         if(discPrepared.has(rid)){ a.sawPrepared = true; }
@@ -1448,6 +1454,8 @@
           cls += a.sawPrepared ? " cp-disc-prepared" : " cp-disc-working";
         }else if(partial.has(k)){
           cls += " cp-partial";
+        }else if(a.allDerived){
+          cls += " cp-derived";
         }
         // Worst status wins and FILLS the dot: one unhealthy connection
         // among many healthy ones must be as loud as a uniformly bad pair.
@@ -1989,7 +1997,7 @@
                         --></span><!--
                         --><span class={"cp-type cp-type-"+flow.type + " " + getDisconnectClass(dev,flow) + " " + (flow.active ? "active" : "") + monitorRing(flow)}
                               on:click|stopPropagation={()=>{ if(bcp008On && flow.monitor){ openMonitorModal(flow); } }}><Icon src={getFlowTypeIcon(flow.type, false)}></Icon>{#if bcp008On && flow.monitor && (flow.monitor.counter || 0) > 0}<span class="cp-status-count">{flow.monitor.counter}</span>{/if}<!--
-                          --><span class="cp-detail"><span class="cp-detail-main">{shortCaps(flow.capLimits)}</span>{#if typeDetailState(flow)}<span class="cp-detail-state">{typeDetailState(flow)}</span>{/if}{#if typeDetailMessage(flow)}<span class="cp-detail-msg">{typeDetailMessage(flow)}</span>{/if}</span><!--
+                          --><span class="cp-detail"><span class="cp-detail-main">{shortCaps(flow.capLimits)}</span>{#if typeDetailState(flow)}<span class="cp-detail-state">{typeDetailState(flow)}</span>{/if}{#if typeDetailMessage(flow)}<span class="cp-detail-msg">{typeDetailMessage(flow)}</span>{/if}{#if flow.connectionNote}<span class="cp-detail-msg">{flow.connectionNote}</span>{/if}</span><!--
                         --></span><!--
                       --></td>
 

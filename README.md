@@ -26,6 +26,8 @@ Tested with a wide range of devices — Lawo, Riedel, Embrionix, AJA, Imagine, S
 
 ![Offline device with Forget buttons](Screenshots/details-offline-forget.png)
 
+- **Connections the registry does not name.** Some devices keep receiving after a reboot but come back with no sender in the registry, so the matrix would show nothing. For such a receiver Crosspoint asks the device itself (IS-05 `/active`): a sender the device names is shown as a normal crosspoint, a sender found by the multicast the receiver takes is shown as a ring. Nothing is stored — a route made outside Crosspoint shows up the same way, and the hover on the receiver says what it receives when no single sender matches.
+
 - **Web-UI links.** One click opens the device's own configuration page in a new tab.
 - **DDNS hostname push.** Each device's name lands as an A record on your DNS server via standard RFC 2136 Dynamic Updates (TSIG-signed) — works with BIND9, Knot, PowerDNS, Windows DNS —, so `Camera1.media.example.net` resolves automatically. (option)
 - **Aliases.** Rename a device or a single flow to whatever your operators call it; the original NMOS label is still visible as a tooltip. NMOS IS-13 is planned to push  the Aliases back to the Device.
