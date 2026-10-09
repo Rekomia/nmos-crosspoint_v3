@@ -124,10 +124,12 @@ That builds the image `nmos-crosspoint_v3:local` and starts the Crosspoint conta
 Keep the image that runs now under its own name, then build the new version:
 
 ```shell
-docker tag nmos-crosspoint_v3:local nmos-crosspoint_v3:backup
+docker tag "$(docker inspect -f '{{.Image}}' nmos-crosspoint_v3)" nmos-crosspoint_v3:backup
 git pull
 docker compose up -d --build
 ```
+
+This tags whatever the running container was started from — also a build from before 4.47, whose image was still called `gemini2350/nmos-crosspoint_v3:latest`.
 
 Back to the previous version, on the same config and state:
 
@@ -142,7 +144,7 @@ docker run -d --restart unless-stopped --network host \
 
 Forward again: `docker rm -f nmos-crosspoint_v3 && docker compose up -d --build`.
 
-Only one Crosspoint may control a plant at a time — stop one before you start the other.
+Only one Crosspoint may control a plant at a time — stop one before you start the other. After a switch in either direction, reload every open browser tab: a tab keeps the UI it was loaded with.
 
 `docker-compose.yml` mounts two persistent folders, so your settings and lease history survive container rebuilds:
 

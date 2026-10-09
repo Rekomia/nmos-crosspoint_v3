@@ -14,11 +14,16 @@ import * as sdpTransform from 'sdp-transform';
 // IS-05 /active from the device and work out what it receives:
 //
 //  - master_enable true and a sender_id: connected to that sender (the
-//    registry has not caught up, or the device does not report it there).
+//    registry has not caught up, or the device does not report it there) —
+//    unless the legs it receives contradict that sender's own.
 //  - master_enable true, no sender_id, but multicast groups: connected to the
-//    one known sender that sends exactly these (group, port, source). Several
-//    or none: no connection is drawn, the note says what it receives.
+//    one ACTIVE known sender that sends exactly these (group, port, source).
+//    Several, none, or only inactive ones: no connection is drawn, the note
+//    says what it receives.
 //  - master_enable false: nothing.
+//
+// What is worked out here is shown, never acted on: the server re-takes only
+// connections the registry names (CrosspointAbstraction.reconnectReceiversOfSender).
 //
 // Nothing here is remembered across restarts: what is shown is what the
 // device says now, so a route made outside the crosspoint shows up as such.
@@ -92,9 +97,17 @@ function sdpMedia(sdp:any, index:number):{ group:string|null, port:number|null, 
     };
 }
 
+/** "auto", or not there at all: the device leaves it open. null is a value
+ *  ("no multicast", "any source") and is not filled in. */
+function leftOpen(v:any):boolean{
+    return v === undefined || v === "auto";
+}
+
 /** The receiver's IS-05 /active, boiled down to what matching needs. Each
- *  leg takes its values from transport_params; the transport file only fills
- *  what they leave open ("auto", null). */
+ *  leg takes its values from transport_params. The transport file — which a
+ *  device keeps from its last activation, whatever came after — only fills
+ *  fields they leave open, and port and source only from an SDP leg on the
+ *  same group. */
 export function receiverConnectionOf(active:any, is04Version:string, now = Date.now()):ReceiverConnection{
     let tps:any[] = (active && Array.isArray(active.transport_params)) ? active.transport_params : [];
     let sdp:any = null;
@@ -108,11 +121,14 @@ export function receiverConnectionOf(active:any, is04Version:string, now = Date.
         let tp = tps[i] || {};
         let fromSdp = sdpMedia(sdp, i);
         let group = cleanIp(tp.multicast_ip);
-        if(!isMulticast(group)){ group = fromSdp.group; }
+        if(!isMulticast(group)){
+            group = leftOpen(tp.multicast_ip) ? fromSdp.group : null;
+        }
+        let sdpAgrees = group !== null && fromSdp.group === group;
         legs.push({
             group,
-            port: cleanPort(tp.destination_port) ?? fromSdp.port,
-            source: cleanIp(tp.source_ip) ?? fromSdp.source,
+            port: cleanPort(tp.destination_port) ?? (sdpAgrees ? fromSdp.port : null),
+            source: cleanIp(tp.source_ip) ?? (sdpAgrees && leftOpen(tp.source_ip) ? fromSdp.source : null),
             enabled: tp.rtp_enabled !== false
         });
     }
@@ -137,87 +153,120 @@ export interface SenderStream {
     active: boolean
 }
 
+export interface SenderStreams {
+    byGroup: Map<string, SenderStream[]>,
+    // Senders with at least one multicast leg we know.
+    known: Set<string>
+}
+
 /** Every known sender's multicast legs, by group. From the sender's IS-05
- *  /active where we have it, from its SDP otherwise. */
-export function senderStreamIndex(nmosState:any):Map<string, SenderStream[]>{
-    let index:Map<string, SenderStream[]> = new Map();
+ *  /active where we have it — a leg it leaves at "auto" from its SDP — and
+ *  from its SDP otherwise. */
+export function senderStreamIndex(nmosState:any):SenderStreams{
+    let byGroup:Map<string, SenderStream[]> = new Map();
+    let known:Set<string> = new Set();
     let senders = nmosState?.senders || {};
     for(let senderId of Object.keys(senders)){
         let s = senders[senderId];
         let act = nmosState.senderActiveData?.[senderId];
+        let sdp = nmosState.sendersManifestDetail?.[senderId];
         let active = (act && typeof act.master_enable === "boolean") ? act.master_enable : !!s?.subscription?.active;
         let legs:Array<{ group:string|null, port:number|null, source:string|null }> = [];
         if(act && Array.isArray(act.transport_params)){
-            for(let tp of act.transport_params){
-                if(!tp || tp.rtp_enabled === false){ continue; }
+            act.transport_params.forEach((tp:any, i:number)=>{
+                if(!tp || tp.rtp_enabled === false){ return; }
                 let group = cleanIp(tp.destination_ip);
-                legs.push({ group: isMulticast(group) ? group : null, port: cleanPort(tp.destination_port), source: cleanIp(tp.source_ip) });
-            }
+                if(isMulticast(group)){
+                    legs.push({ group, port: cleanPort(tp.destination_port), source: cleanIp(tp.source_ip) });
+                }else if(leftOpen(tp.destination_ip)){
+                    legs.push(sdpMedia(sdp, i));
+                }
+            });
         }else{
-            let sdp = nmosState.sendersManifestDetail?.[senderId];
             let n = (sdp && Array.isArray(sdp.media)) ? sdp.media.length : 0;
             for(let i = 0; i < n; i++){ legs.push(sdpMedia(sdp, i)); }
         }
         for(let leg of legs){
             if(!leg.group){ continue; }
-            if(!index.has(leg.group)){ index.set(leg.group, []); }
-            index.get(leg.group)!.push({ senderId, port: leg.port, source: leg.source, active });
+            known.add(senderId);
+            if(!byGroup.has(leg.group)){ byGroup.set(leg.group, []); }
+            byGroup.get(leg.group)!.push({ senderId, port: leg.port, source: leg.source, active });
         }
     }
-    return index;
+    return { byGroup, known };
+}
+
+function legMatches(leg:ReceiverLeg, e:SenderStream):boolean{
+    if(leg.port !== null && e.port !== null && e.port !== leg.port){ return false; }
+    if(leg.source && e.source && e.source !== leg.source){ return false; }
+    return true;
 }
 
 /** What to show for a receiver whose registry entry names no sender. */
-export function deriveReceiverConnection(conn:ReceiverConnection|null|undefined, streams:Map<string, SenderStream[]>,
+export function deriveReceiverConnection(conn:ReceiverConnection|null|undefined, streams:SenderStreams,
                                          labelOf:(senderId:string) => string = (id) => id):DerivedConnection|null{
     if(!conn || !conn.masterEnable){ return null; }
-    if(conn.senderId){
-        return {
-            via: "device",
-            senderId: conn.senderId,
-            note: "Read from the device: the registry does not name the sender.",
-            key: "device:" + conn.senderId
-        };
-    }
     let legs = conn.legs.filter((l) => l.enabled && !!l.group);
-    if(legs.length === 0){ return null; }
     let where = legs.map((l) => l.group + (l.port !== null ? ":" + l.port : "")).join(" + ");
+
+    if(conn.senderId){
+        // The device names its sender. Believed unless what it receives
+        // contradicts what that sender sends: then the sender_id is a
+        // leftover and the stream decides.
+        let named = conn.senderId;
+        let contradicts = streams.known.has(named) && legs.some((leg) =>
+            !(streams.byGroup.get(leg.group as string) || []).some((e) => e.senderId === named && legMatches(leg, e)));
+        if(!contradicts){
+            return {
+                via: "device",
+                senderId: named,
+                note: "Read from the device: the registry does not name the sender.",
+                key: "device:" + named
+            };
+        }
+    }
+    if(legs.length === 0){ return null; }
 
     // A sender matches when it sends every leg the receiver takes.
     let candidates:Set<string>|null = null;
     let activeOf:Map<string, boolean> = new Map();
     for(let leg of legs){
         let ids:Set<string> = new Set();
-        for(let e of streams.get(leg.group as string) || []){
-            if(leg.port !== null && e.port !== null && e.port !== leg.port){ continue; }
-            if(leg.source && e.source && e.source !== leg.source){ continue; }
+        for(let e of streams.byGroup.get(leg.group as string) || []){
+            if(!legMatches(leg, e)){ continue; }
             ids.add(e.senderId);
             activeOf.set(e.senderId, e.active || !!activeOf.get(e.senderId));
         }
         candidates = (candidates === null) ? ids : new Set(Array.from(candidates).filter((id) => ids.has(id)));
     }
     let list = Array.from(candidates || []);
-    // Two senders on one group: only one of them can be on the wire.
-    if(list.length > 1){
-        let on = list.filter((id) => activeOf.get(id));
-        if(on.length === 1){ list = on; }
-    }
-    if(list.length === 1){
+    // Only a sender that is on can be what the receiver gets.
+    let on = list.filter((id) => activeOf.get(id));
+    let names = (ids:string[]) => ids.slice(0, 5).map((id) => "\"" + labelOf(id) + "\"").join(", ") + (ids.length > 5 ? ", …" : "");
+    let named = conn.senderId ? " The device names \"" + labelOf(conn.senderId) + "\", which does not send this." : "";
+    if(on.length === 1){
         return {
             via: "stream",
-            senderId: list[0],
-            note: "Matched by stream " + where + ": the device does not name its sender.",
-            key: "stream:" + list[0] + "@" + where
+            senderId: on[0],
+            note: "Matched by stream " + where + ": the device does not name its sender." + named,
+            key: "stream:" + on[0] + "@" + where
         };
     }
-    if(list.length === 0){
-        return { via: "", senderId: "", note: "Receives " + where + ": no known sender sends this.", key: "unknown@" + where };
+    if(on.length > 1){
+        return {
+            via: "",
+            senderId: "",
+            note: "Receives " + where + ": sent by " + on.length + " senders (" + names(on) + ")." + named,
+            key: "ambiguous@" + where + ":" + on.sort().join(",")
+        };
     }
-    let names = list.slice(0, 5).map((id) => "\"" + labelOf(id) + "\"").join(", ") + (list.length > 5 ? ", …" : "");
-    return {
-        via: "",
-        senderId: "",
-        note: "Receives " + where + ": sent by " + list.length + " senders (" + names + ").",
-        key: "ambiguous@" + where + ":" + list.sort().join(",")
-    };
+    if(list.length > 0){
+        return {
+            via: "",
+            senderId: "",
+            note: "Receives " + where + ": only inactive senders are set to it (" + names(list) + ")." + named,
+            key: "inactive@" + where + ":" + list.sort().join(",")
+        };
+    }
+    return { via: "", senderId: "", note: "Receives " + where + ": no known sender sends this." + named, key: "unknown@" + where };
 }

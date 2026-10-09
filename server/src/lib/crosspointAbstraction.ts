@@ -920,6 +920,12 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
      *
      * Always runs (no settings gate). Caller is responsible for triggering
      * only when an actual change happened.
+     *
+     * Only receivers whose REGISTRY entry names the sender are re-taken. A
+     * connection read from the device or matched by stream (connectedVia
+     * "device" / "stream") is shown, never acted on without a click: it may
+     * be stale or a wrong match, and re-taking it would put a receiver on
+     * air that an operator switched off.
      */
     public reconnectReceiversOfSender( senderId:string ){
         let nmos_senderId = "nmos_"+senderId
@@ -941,6 +947,11 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                 for( let flow of dev.receivers[type]){
                     if(flow.connectedFlow == nmos_senderId){
                        let dst = flow;
+                       if(dst.connectedVia && dst.connectedVia !== "registry"){
+                           SyncLog.log("info", "crosspoint", "Not reconnecting receiver " + dst.id + " to " + src.id +
+                               ": the registry does not name this connection (" + dst.connectedVia + ").");
+                           continue;
+                       }
                        this.executeConnection(src,dst).then(()=>{}).catch(()=>{});
                        SyncLog.log("info", "crosspoint", "Reconnecting receiver " + dst.id + " because sender " + src.id + " transport params changed.");
                     }
@@ -954,7 +965,8 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
      * in nmosConnector — covers anything: multicast IP, port, channel count,
      * video format, colorimetry, transfer characteristic, …).
      *
-     * Gated by `settings.reconnectReceiversOnSenderChange` (default true).
+     * Gated by `settings.reconnectReceiversOnSenderChange` (parseSettings
+     * makes it false when it is missing).
      * The legacy `settings.reconnectOnSdpChanges` flag is still respected for
      * back-compat: if it's explicitly set to true, reconnects fire even when
      * the new toggle is off.

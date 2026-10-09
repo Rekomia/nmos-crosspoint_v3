@@ -3,7 +3,7 @@ import { ComplexCompare, ShortenNames } from "./functions";
 
 import { BitrateCalculator } from "./bitrateHelper/BitrateCalculator"
 import { parseSettings } from "./parseSettings";
-import { deriveReceiverConnection, SenderStream, senderStreamIndex } from "./receiverConnection";
+import { deriveReceiverConnection, SenderStreams, senderStreamIndex } from "./receiverConnection";
 
 const crypto = require('crypto');
 const md5 = data => crypto.createHash('md5').update(data).digest("hex")
@@ -897,7 +897,7 @@ class CrosspointUpdateThread{
         }
         // Senders by multicast group, built on first need: only receivers
         // whose registry entry names no sender look into it.
-        let streams:Map<string, SenderStream[]>|null = null;
+        let streams:SenderStreams|null = null;
         const streamIndex = () => {
             if(streams === null){ streams = senderStreamIndex(this.nmosState); }
             return streams;

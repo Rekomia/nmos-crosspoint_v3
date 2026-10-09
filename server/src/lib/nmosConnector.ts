@@ -897,6 +897,8 @@ export class NmosRegistryConnector {
         // every subscribed client.
         this.receiverReadTimers.forEach((timer)=>{ clearTimeout(timer); });
         this.receiverReadTimers.clear();
+        if(this.arrivedDevicesTimer){ clearTimeout(this.arrivedDevicesTimer); this.arrivedDevicesTimer = null; }
+        this.arrivedDevices.clear();
         this.nmosState = {
             devices: {}, sources: {}, senders: {}, receivers: {},
             flows: {}, nodes: {}, senderActiveData: {}, receiverActiveData: {},
@@ -1010,6 +1012,7 @@ export class NmosRegistryConnector {
             const src = this.nmosState[type][id]?.["_sourceRegistry"];
             if(src === registryUrl || (!src && soleRegistry)){
                 delete this.nmosState[type][id];
+                this.dropFollowUps(type, id);
                 removed.push(id);
             }
         }
@@ -1050,17 +1053,23 @@ export class NmosRegistryConnector {
             this.finishRemoval(type, id);
         }, NmosRegistryConnector.REMOVAL_GRACE_MS));
     }
-    private cancelRemoval(type:string, id:string){
+    private cancelRemoval(type:string, id:string):boolean{
         const key = type + "/" + id;
         const timer = this.pendingRemovals.get(key);
-        if(timer === undefined) return;
+        if(timer === undefined) return false;
         clearTimeout(timer);
         this.pendingRemovals.delete(key);
+        if(type === "senders"){ this.reRegisteredSenders.add(id); }
         this.noteReRegistered(type, id);
+        return true;
     }
+    // Senders back within the grace whose next SDP is not to be compared
+    // with the cached one (see getSenderManifestData).
+    private reRegisteredSenders:Set<string> = new Set();
     private clearPendingRemovals(){
         this.pendingRemovals.forEach((timer)=>{ clearTimeout(timer); });
         this.pendingRemovals.clear();
+        this.reRegisteredSenders.clear();
     }
     private finishRemoval(type:string, id:string){
         if(!this.nmosState[type] || !this.nmosState[type][id]) return;
@@ -1074,6 +1083,18 @@ export class NmosRegistryConnector {
                 }
             }catch(e){}
         }
+        this.dropFollowUps(type, id);
+        this.scheduleSyncNmos();
+        this.updateCrosspoint();
+    }
+    /** What hangs off a sender or receiver besides its registry entry. Used
+     *  when the entry goes, by a removal or by the re-sync. */
+    private dropFollowUps(type:string, id:string){
+        const pending = this.pendingRemovals.get(type + "/" + id);
+        if(pending !== undefined){
+            clearTimeout(pending);
+            this.pendingRemovals.delete(type + "/" + id);
+        }
         if(type === "senders"){
             const fetchTimer = this.manifestFetchTimers.get(id);
             if(fetchTimer){
@@ -1082,13 +1103,12 @@ export class NmosRegistryConnector {
             }
             delete this.nmosState.sendersManifestDetail[id];
             delete this.nmosState.senderActiveData[id];
+            this.reRegisteredSenders.delete(id);
         }
         if(type === "receivers"){
             this.cancelReceiverRead(id);
             delete this.nmosState.receiverActiveData[id];
         }
-        this.scheduleSyncNmos();
-        this.updateCrosspoint();
     }
 
     // One log line per burst, so a device that re-registers is visible in
@@ -1127,6 +1147,7 @@ export class NmosRegistryConnector {
         let type = "";
         let changes = false;
         let changesConnect = false;
+        let newIds:Set<string> = new Set();
         try {
             type = (message.grain.topic as string).split("/").join("");
         } catch (e) {}
@@ -1139,9 +1160,12 @@ export class NmosRegistryConnector {
                         // add or update element
                         if (typeof g.post == "object") {
                             // Back inside the removal grace: the entry never
-                            // left, so this is an update, not a new item.
-                            this.cancelRemoval(type, g.path);
-                            if(this.nmosState[type][g.path] && !this.versionIsPrefered(this.nmosState[type][g.path]["_sourceVersion"], version)){
+                            // left, so this is an update, not a new item. It
+                            // takes the version guard's place too: in 4.44
+                            // the entry was gone by now and the post came in
+                            // as new, whatever version it carried.
+                            let reRegistered = this.cancelRemoval(type, g.path);
+                            if(!reRegistered && this.nmosState[type][g.path] && !this.versionIsPrefered(this.nmosState[type][g.path]["_sourceVersion"], version)){
                                 // do not update
                             }else{
                                 let postData = g.post;
@@ -1153,6 +1177,7 @@ export class NmosRegistryConnector {
                                 }else{
                                     newItem = true;
                                     changes = true;
+                                    newIds.add(g.path);
                                 }
 
                                 postData["_sourceVersion"] = version;
@@ -1274,6 +1299,10 @@ export class NmosRegistryConnector {
                         // part of the snapshot a (re)subscription starts with.
                         this.receiverChanged(g.path, !g.hasOwnProperty("pre"));
                     }
+
+                    if(type == "devices" && newIds.has(g.path)){
+                        this.deviceArrived(g.path);
+                    }
                 });
 
 
@@ -1286,13 +1315,16 @@ export class NmosRegistryConnector {
     // sender_id in its IS-04 subscription: the picture runs, the matrix shows
     // nothing. For such a receiver we ask the device itself (IS-05 /active)
     // and keep the answer in receiverActiveData; the worker works out the
-    // sender from it (receiverConnection.ts). Event driven, no polling: one
-    // read whenever the receiver's registry entry changes.
+    // sender from it (receiverConnection.ts). Event driven, no polling: a
+    // read when the receiver's registry entry changes, after each of our own
+    // takes on it, and when its device turns up late.
     private receiverReadTimers: Map<string, any> = new Map();
     // A device that just (re)registered may restore its connection a little
     // later without touching IS-04 — ask again after these delays while it
     // shows no stream.
     private static RECEIVER_RETRY_MS = [10000, 30000];
+    // A read that got no answer is tried once more after this.
+    private static RECEIVER_FAIL_RETRY_MS = [30000];
 
     private receiverChanged(receiverId:string, justRegistered:boolean){
         let receiver:any = this.nmosState.receivers[receiverId];
@@ -1308,8 +1340,10 @@ export class NmosRegistryConnector {
             }
             return;
         }
-        // Already read for exactly this state (a re-sync repeats it).
-        if(known && known.is04Version === "" + receiver.version){ return; }
+        // Already read for exactly this state (a re-sync repeats it). Not
+        // after a fresh registration: the device may have changed meanwhile
+        // without its IS-04 version showing it.
+        if(!justRegistered && known && known.is04Version === "" + receiver.version){ return; }
         if(known){
             // Stale from here on: nothing rather than an old answer.
             delete this.nmosState.receiverActiveData[receiverId];
@@ -1319,14 +1353,56 @@ export class NmosRegistryConnector {
         this.scheduleReceiverRead(receiverId, 300, justRegistered ? NmosRegistryConnector.RECEIVER_RETRY_MS : []);
     }
 
-    private scheduleReceiverRead(receiverId:string, delay:number, retries:number[]){
+    /** After a take, disconnect or enable/disable we sent: what was shown
+     *  from the device is out of date, whatever IS-04 does next. */
+    private receiverTaken(receiverId:string){
+        let receiver:any = this.nmosState.receivers[receiverId];
+        if(!receiver){ return; }
+        if(this.nmosState.receiverActiveData[receiverId]){
+            delete this.nmosState.receiverActiveData[receiverId];
+            this.scheduleSyncNmos();
+            this.updateCrosspoint();
+        }
+        // Read only if the registry does not name the sender — a device that
+        // updates IS-04 on a take brings its own grain.
+        this.scheduleReceiverRead(receiverId, 1000, []);
+    }
+
+    // Devices that turned up after their receivers (a snapshot can deliver
+    // them in either order): their receivers are read once they are there.
+    private arrivedDevices:Set<string> = new Set();
+    private arrivedDevicesTimer:any = null;
+    private deviceArrived(deviceId:string){
+        this.arrivedDevices.add(deviceId);
+        if(this.arrivedDevicesTimer){ return; }
+        this.arrivedDevicesTimer = setTimeout(()=>{
+            this.arrivedDevicesTimer = null;
+            let devices = this.arrivedDevices;
+            this.arrivedDevices = new Set();
+            for(let id of Object.keys(this.nmosState.receivers)){
+                let r:any = this.nmosState.receivers[id];
+                if(!r || !devices.has(r.device_id)){ continue; }
+                if(this.nmosState.receiverActiveData[id] || this.receiverReadTimers.has(id)){ continue; }
+                let sub = r.subscription;
+                if(sub && sub.active && sub.sender_id){ continue; }
+                this.scheduleReceiverRead(id, 0, []);
+            }
+        }, 500);
+    }
+
+    private scheduleReceiverRead(receiverId:string, delay:number, idleRetries:number[],
+                                 failRetries:number[] = NmosRegistryConnector.RECEIVER_FAIL_RETRY_MS){
         this.cancelReceiverRead(receiverId);
         this.receiverReadTimers.set(receiverId, setTimeout(()=>{
             this.receiverReadTimers.delete(receiverId);
-            this.readReceiverConnection(receiverId).then((receiving)=>{
+            this.readReceiverConnection(receiverId).then((result)=>{
                 // A newer registry change has scheduled its own read.
-                if(receiving || retries.length === 0 || this.receiverReadTimers.has(receiverId)){ return; }
-                this.scheduleReceiverRead(receiverId, retries[0], retries.slice(1));
+                if(this.receiverReadTimers.has(receiverId)){ return; }
+                if(result === "idle" && idleRetries.length > 0){
+                    this.scheduleReceiverRead(receiverId, idleRetries[0], idleRetries.slice(1), failRetries);
+                }else if(result === "failed" && failRetries.length > 0){
+                    this.scheduleReceiverRead(receiverId, failRetries[0], [], failRetries.slice(1));
+                }
             }).catch(()=>{});
         }, delay));
     }
@@ -1339,14 +1415,18 @@ export class NmosRegistryConnector {
         }
     }
 
-    /** Reads the receiver's IS-05 /active and stores it. Resolves true when
-     *  the receiver takes a stream (or the registry names its sender by now). */
-    private async readReceiverConnection(receiverId:string):Promise<boolean>{
+    /** Reads the receiver's IS-05 /active and stores it.
+     *  "receiving": takes a stream (or the registry names its sender by now).
+     *  "idle": the device answered, no stream. "failed": no answer.
+     *  "nodevice": its device is not known yet (deviceArrived reads it).
+     *  "stale": the receiver changed or went while we waited. */
+    private async readReceiverConnection(receiverId:string):Promise<"receiving"|"idle"|"failed"|"nodevice"|"stale">{
         let receiver:any = this.nmosState.receivers[receiverId];
-        if(!receiver){ return false; }
+        if(!receiver){ return "stale"; }
         let sub = receiver.subscription;
-        if(sub && sub.active && sub.sender_id){ return true; }
+        if(sub && sub.active && sub.sender_id){ return "receiving"; }
         let device:any = this.nmosState.devices[receiver.device_id];
+        if(!device){ return "nodevice"; }
         let hrefs:string[] = [];
         for(let ctrlType of ["urn:x-nmos:control:sr-ctrl/v1.1", "urn:x-nmos:control:sr-ctrl/v1.0"]){
             for(let c of NmosRegistryConnector.controlsOf(device)){
@@ -1354,7 +1434,8 @@ export class NmosRegistryConnector {
             }
             if(hrefs.length > 0){ break; }
         }
-        if(hrefs.length === 0){ return false; }
+        // No IS-05 control: nothing to ask, and asking again will not help.
+        if(hrefs.length === 0){ return "idle"; }
 
         let version = "" + receiver.version;
         let active:any = null;
@@ -1364,8 +1445,8 @@ export class NmosRegistryConnector {
         }
         // Changed or gone while we waited: that change brings its own read.
         let now:any = this.nmosState.receivers[receiverId];
-        if(!now || ("" + now.version) !== version){ return true; }
-        if(!active){ return false; }
+        if(!now || ("" + now.version) !== version){ return "stale"; }
+        if(!active){ return "failed"; }
 
         let conn = receiverConnectionOf(active, version);
         let before:any = this.nmosState.receiverActiveData[receiverId];
@@ -1376,7 +1457,7 @@ export class NmosRegistryConnector {
             this.scheduleSyncNmos();
             this.updateCrosspoint();
         }
-        return isReceiving(conn);
+        return isReceiving(conn) ? "receiving" : "idle";
     }
 
     async loadChannelMaping(postData:any){
@@ -1528,7 +1609,14 @@ export class NmosRegistryConnector {
                                         this.scheduleSyncNmos();
                                     }catch(e){}
                                 }else{
-                                    if(this.nmosState["sendersManifestDetail"][senderId] && this.nmosState["sendersManifestDetail"][senderId]._RAWSDP && this.nmosState["sendersManifestDetail"][senderId]._RAWSDP.length > 10 ){
+                                    // First SDP after the sender re-registered
+                                    // within the removal grace: 4.44 had
+                                    // dropped the cached one by then, so a
+                                    // re-registration never counted as an SDP
+                                    // change (a new o= line alone would
+                                    // re-take every receiver of it).
+                                    let afterReRegistration = this.reRegisteredSenders.delete(senderId);
+                                    if(!afterReRegistration && this.nmosState["sendersManifestDetail"][senderId] && this.nmosState["sendersManifestDetail"][senderId]._RAWSDP && this.nmosState["sendersManifestDetail"][senderId]._RAWSDP.length > 10 ){
                                         if(this.nmosState["sendersManifestDetail"][senderId]._RAWSDP != sdp["_RAWSDP"]){
                                             this.reconnectOnChanges(senderId);
                                         }
@@ -2249,6 +2337,14 @@ export class NmosRegistryConnector {
     }
 
     async makeConnection(receiverId:string, senderInfo: CrosspointConnectionSenderInfo){
+        try{
+            return await this.makeConnectionNow(receiverId, senderInfo);
+        }finally{
+            this.receiverTaken(receiverId);
+        }
+    }
+
+    private async makeConnectionNow(receiverId:string, senderInfo: CrosspointConnectionSenderInfo){
 
         if(senderInfo.error != ""){
             SyncLog.log("warning", "NMOS Connect", "No valid sender Info: " + senderInfo.error);
@@ -2858,6 +2954,14 @@ export class NmosRegistryConnector {
      */
     async enableReceiver(receiverId:string, disable=false){
         try{
+            return await this.enableReceiverNow(receiverId, disable);
+        }finally{
+            this.receiverTaken(receiverId);
+        }
+    }
+
+    private async enableReceiverNow(receiverId:string, disable=false){
+        try{
             let versionFound = false;
             let controlHrefs:any[] = [];
 
@@ -3165,7 +3269,7 @@ export class NmosRegistryConnector {
                     // reconnect them so they pick up the new manifest.
                     //
                     // Gated by `settings.reconnectReceiversOnSenderChange`
-                    // (default true). The caller can force the reconnect by
+                    // (false when missing). The caller can force the reconnect by
                     // setting `data._forceReconnect = true` — used by the
                     // "Reallocate from pool" sweep when Auto-Allocation is
                     // toggled on, where receivers must follow no matter what.
