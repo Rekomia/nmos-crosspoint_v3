@@ -15,7 +15,7 @@ import * as sdpTransform from 'sdp-transform';
 //
 //  - master_enable true and a sender_id: connected to that sender (the
 //    registry has not caught up, or the device does not report it there) —
-//    unless the legs it receives contradict that sender's own.
+//    unless a leg it receives is positively another sender's stream.
 //  - master_enable true, no sender_id, but multicast groups: connected to the
 //    one ACTIVE known sender that sends exactly these (group, port, source).
 //    Several, none, or only inactive ones: no connection is drawn, the note
@@ -150,13 +150,17 @@ export interface SenderStream {
     senderId: string,
     port: number|null,
     source: string|null,
-    active: boolean
+    // The sender is on. True also when nothing says either way (no IS-04
+    // subscription below v1.2, no /active read): unknown is not "off".
+    active: boolean,
+    // The leg itself is on (rtp_enabled). An off leg still says where the
+    // sender is set to send — enough to back a sender_id the device names,
+    // not enough to match a stream.
+    enabled: boolean
 }
 
 export interface SenderStreams {
-    byGroup: Map<string, SenderStream[]>,
-    // Senders with at least one multicast leg we know.
-    known: Set<string>
+    byGroup: Map<string, SenderStream[]>
 }
 
 /** Every known sender's multicast legs, by group. From the sender's IS-05
@@ -164,36 +168,39 @@ export interface SenderStreams {
  *  from its SDP otherwise. */
 export function senderStreamIndex(nmosState:any):SenderStreams{
     let byGroup:Map<string, SenderStream[]> = new Map();
-    let known:Set<string> = new Set();
     let senders = nmosState?.senders || {};
     for(let senderId of Object.keys(senders)){
         let s = senders[senderId];
         let act = nmosState.senderActiveData?.[senderId];
         let sdp = nmosState.sendersManifestDetail?.[senderId];
-        let active = (act && typeof act.master_enable === "boolean") ? act.master_enable : !!s?.subscription?.active;
-        let legs:Array<{ group:string|null, port:number|null, source:string|null }> = [];
+        // Either side saying "on" counts: the cached /active can lag behind
+        // an activation the registry already shows, and the other way round.
+        let is04 = s?.subscription?.active;
+        let is05 = act ? act.master_enable : undefined;
+        let active = is04 === true || is05 === true || (typeof is04 !== "boolean" && typeof is05 !== "boolean");
+        let legs:Array<{ group:string|null, port:number|null, source:string|null, enabled:boolean }> = [];
         if(act && Array.isArray(act.transport_params)){
             act.transport_params.forEach((tp:any, i:number)=>{
-                if(!tp || tp.rtp_enabled === false){ return; }
+                if(!tp){ return; }
+                let enabled = tp.rtp_enabled !== false;
                 let group = cleanIp(tp.destination_ip);
                 if(isMulticast(group)){
-                    legs.push({ group, port: cleanPort(tp.destination_port), source: cleanIp(tp.source_ip) });
+                    legs.push({ group, port: cleanPort(tp.destination_port), source: cleanIp(tp.source_ip), enabled });
                 }else if(leftOpen(tp.destination_ip)){
-                    legs.push(sdpMedia(sdp, i));
+                    legs.push({ ...sdpMedia(sdp, i), enabled });
                 }
             });
         }else{
             let n = (sdp && Array.isArray(sdp.media)) ? sdp.media.length : 0;
-            for(let i = 0; i < n; i++){ legs.push(sdpMedia(sdp, i)); }
+            for(let i = 0; i < n; i++){ legs.push({ ...sdpMedia(sdp, i), enabled: true }); }
         }
         for(let leg of legs){
             if(!leg.group){ continue; }
-            known.add(senderId);
             if(!byGroup.has(leg.group)){ byGroup.set(leg.group, []); }
-            byGroup.get(leg.group)!.push({ senderId, port: leg.port, source: leg.source, active });
+            byGroup.get(leg.group)!.push({ senderId, port: leg.port, source: leg.source, active, enabled: leg.enabled });
         }
     }
-    return { byGroup, known };
+    return { byGroup };
 }
 
 function legMatches(leg:ReceiverLeg, e:SenderStream):boolean{
@@ -210,12 +217,16 @@ export function deriveReceiverConnection(conn:ReceiverConnection|null|undefined,
     let where = legs.map((l) => l.group + (l.port !== null ? ":" + l.port : "")).join(" + ");
 
     if(conn.senderId){
-        // The device names its sender. Believed unless what it receives
-        // contradicts what that sender sends: then the sender_id is a
-        // leftover and the stream decides.
+        // The device names its sender. Believed unless a leg it receives is
+        // positively someone else's: another sender sends exactly that
+        // stream, and the named one is not set to it (not even on a leg it
+        // has switched off). Then the sender_id is a leftover and the stream
+        // decides. A group nobody is known to send proves nothing.
         let named = conn.senderId;
-        let contradicts = streams.known.has(named) && legs.some((leg) =>
-            !(streams.byGroup.get(leg.group as string) || []).some((e) => e.senderId === named && legMatches(leg, e)));
+        let contradicts = legs.some((leg) => {
+            let here = (streams.byGroup.get(leg.group as string) || []).filter((e) => legMatches(leg, e));
+            return !here.some((e) => e.senderId === named) && here.some((e) => e.enabled && e.senderId !== named);
+        });
         if(!contradicts){
             return {
                 via: "device",
@@ -233,7 +244,7 @@ export function deriveReceiverConnection(conn:ReceiverConnection|null|undefined,
     for(let leg of legs){
         let ids:Set<string> = new Set();
         for(let e of streams.byGroup.get(leg.group as string) || []){
-            if(!legMatches(leg, e)){ continue; }
+            if(!e.enabled || !legMatches(leg, e)){ continue; }
             ids.add(e.senderId);
             activeOf.set(e.senderId, e.active || !!activeOf.get(e.senderId));
         }
