@@ -24,6 +24,7 @@ import { MulticastLeaseManager } from "./multicastLeaseManager";
 import { DdnsService } from "./ddnsService";
 import { deviceQueueKey, deviceRequest, markUnresponsive, neverConnected, noAnswer, withDevice } from "./deviceHttp";
 import { isReceiving, receiverConnectionOf } from "./receiverConnection";
+import { Bcp008Monitor } from "./bcp008Monitor";
 
 const fs = require("fs");
 
@@ -1012,6 +1013,10 @@ export class NmosRegistryConnector {
             if(seen.has(id)) continue;
             const src = this.nmosState[type][id]?.["_sourceRegistry"];
             if(src === registryUrl || (!src && soleRegistry)){
+                // Its removal had taken effect and it was on its way back:
+                // when it registers again, that is still a return.
+                if(type === "senders" && this.returnedSenders.has(id)){ this.noteSenderGone(id); }
+                if(type === "receivers" && this.returnedReceivers.has(id)){ this.noteReceiverGone(id); }
                 delete this.nmosState[type][id];
                 this.dropFollowUps(type, id);
                 removed.push(id);
@@ -1043,7 +1048,7 @@ export class NmosRegistryConnector {
     // default) before it removes one.
     private static REMOVAL_GRACE_MS = 3000;
     private pendingRemovals: Map<string, any> = new Map();
-    private deferRemoval(type:string, id:string){
+    private deferRemoval(type:string, id:string, registryUrl:string = ""){
         const key = type + "/" + id;
         // A repeated removal keeps the first deadline.
         if(this.pendingRemovals.has(key)) return;
@@ -1051,7 +1056,7 @@ export class NmosRegistryConnector {
         this.pendingRemovals.set(key, setTimeout(()=>{
             this.pendingRemovals.delete(key);
             if(myGen !== this.registryGen) return;
-            this.finishRemoval(type, id);
+            this.finishRemoval(type, id, registryUrl);
         }, NmosRegistryConnector.REMOVAL_GRACE_MS));
     }
     private cancelRemoval(type:string, id:string):boolean{
@@ -1075,9 +1080,19 @@ export class NmosRegistryConnector {
         this.pendingRemovals.forEach((timer)=>{ clearTimeout(timer); });
         this.pendingRemovals.clear();
         this.reRegisteredSenders.clear();
+        this.clearSenderReturns();
     }
-    private finishRemoval(type:string, id:string){
+    private finishRemoval(type:string, id:string, registryUrl:string = ""){
         if(!this.nmosState[type] || !this.nmosState[type][id]) return;
+        // Gone for a re-take only when the registry that holds the entry
+        // says so — the rule the re-sync uses. With two registries, the one
+        // a node failed over from expires it a little later, and the stream
+        // never stopped.
+        const src = this.nmosState[type][id]?.["_sourceRegistry"];
+        if(this.nmosRegistryList.length <= 1 || !src || !registryUrl || src === registryUrl){
+            if(type === "senders"){ this.noteSenderGone(id); }
+            if(type === "receivers"){ this.noteReceiverGone(id); }
+        }
         delete this.nmosState[type][id];
         // DNS Push: a node that's gone from the registry should not keep a
         // stale DNS entry.
@@ -1109,8 +1124,10 @@ export class NmosRegistryConnector {
             delete this.nmosState.sendersManifestDetail[id];
             delete this.nmosState.senderActiveData[id];
             this.reRegisteredSenders.delete(id);
+            this.cancelSenderReturn(id);
         }
         if(type === "receivers"){
+            this.cancelReceiverReturn(id);
             this.cancelReceiverRead(id);
             delete this.nmosState.receiverActiveData[id];
         }
@@ -1143,6 +1160,375 @@ export class NmosRegistryConnector {
                 (NmosRegistryConnector.REMOVAL_GRACE_MS / 1000) + " s" + (names.length ? " (" + names.join(", ") + ")" : "") +
                 " — kept online instead of showing them offline.", { counts, names });
         }, 2000);
+    }
+
+    // ----- Senders that come back -----
+    // A sender that really left the registry (its removal took effect after
+    // the grace) and registers again has as a rule restarted: a new RTP
+    // stream, often a new SDP. Receivers still set to it keep what they were
+    // given before, and some never take the new stream until they are
+    // activated again — seen after a sender restart: the receiver kept its
+    // settings, BCP-008 green, no picture until it was routed again. So once
+    // the sender is back and transmits, every receiver whose registry entry
+    // still names it gets it once more, with the SDP it publishes now
+    // (CrosspointAbstraction.retakeReceiversOfReturnedSender).
+    // Not a return: the re-sync (a registry restart drops and re-adds what
+    // never left the network), a re-registration within the removal grace,
+    // a registry switch, a removal from a registry that does not hold the
+    // entry, and our own virtual senders. Nor is a sender that comes back
+    // exactly as it went — same IS-04 version, same SDP: its registration
+    // lapsed (a control network outage, a registry that expired every
+    // node), its stream never stopped, and re-taking would hit every
+    // receiver on air for nothing.
+    private goneSenders: Map<string, { at:number, sdp:string, version:string }> = new Map();
+    private returnedSenders: Map<string, { goneAt:number, backAt:number, before:string, beforeVersion:string,
+                                           sdp:string, sdpAt:number, activeAt:number, readyAt:number, timer:any }> = new Map();
+    private static GONE_SENDERS_MAX = 2000;
+    // Active and with a media section, and neither the SDP nor the active
+    // state changed for this long.
+    private static RETURN_SETTLE_MS = 10000;
+    // Then, if its device has a BCP-008 monitor, up to this long more for
+    // the sender to report itself (partially) healthy, i.e. transmitting.
+    private static RETURN_MONITOR_WAIT_MS = 60000;
+    private static RETURN_CHECK_MS = 2000;
+    private static RETURN_GIVE_UP_MS = 10 * 60 * 1000;
+
+    private noteSenderGone(senderId:string){
+        // Gone again before its receivers were taken: they still hold what
+        // they had before the first outage, so that is what we compare with.
+        const pending = this.returnedSenders.get(senderId);
+        const raw = this.nmosState.sendersManifestDetail?.[senderId]?._RAWSDP;
+        const version = "" + (this.nmosState.senders[senderId]?.version || "");
+        const gone = pending ? { at: pending.goneAt, sdp: pending.before, version: pending.beforeVersion }
+                             : { at: Date.now(), sdp: typeof raw === "string" ? raw : "", version };
+        this.cancelSenderReturn(senderId);
+        NmosRegistryConnector.capped(this.goneSenders, senderId, gone);
+    }
+
+    /** Set, as the newest entry, and drop the oldest beyond
+     *  GONE_SENDERS_MAX — a Map iterates in insertion order. */
+    private static capped<T>(map:Map<string, T>, key:string, value:T){
+        map.delete(key);
+        map.set(key, value);
+        if(map.size > NmosRegistryConnector.GONE_SENDERS_MAX){
+            map.delete(map.keys().next().value);
+        }
+    }
+
+    private senderArrived(senderId:string){
+        const gone = this.goneSenders.get(senderId);
+        if(!gone) return;
+        this.goneSenders.delete(senderId);
+        const sender:any = this.nmosState.senders[senderId];
+        const virtualDevice = this.settings?.virtualNode?.deviceId;
+        // Our own registration: the stream behind it never stopped.
+        if(!sender || (virtualDevice && sender.device_id === virtualDevice)) return;
+        this.cancelSenderReturn(senderId);
+        this.returnedSenders.set(senderId, { goneAt: gone.at, backAt: Date.now(), before: gone.sdp, beforeVersion: gone.version,
+                                             sdp: "", sdpAt: 0, activeAt: 0, readyAt: 0, timer: null });
+        this.armSenderReturn(senderId);
+    }
+
+    private armSenderReturn(senderId:string){
+        const r = this.returnedSenders.get(senderId);
+        if(!r) return;
+        r.timer = setTimeout(()=>{
+            r.timer = null;
+            try{ this.checkSenderReturn(senderId); }catch(e){ this.returnedSenders.delete(senderId); }
+        }, NmosRegistryConnector.RETURN_CHECK_MS);
+    }
+
+    private cancelSenderReturn(senderId:string){
+        const r = this.returnedSenders.get(senderId);
+        if(!r) return;
+        if(r.timer){ clearTimeout(r.timer); }
+        this.returnedSenders.delete(senderId);
+    }
+
+    private clearSenderReturns(){
+        this.returnedSenders.forEach((r)=>{ if(r.timer){ clearTimeout(r.timer); } });
+        this.returnedSenders.clear();
+        this.goneSenders.clear();
+        this.senderRetakenAt.clear();
+        this.returnedReceivers.forEach((r)=>{ if(r.timer){ clearTimeout(r.timer); } });
+        this.returnedReceivers.clear();
+        this.goneReceivers.clear();
+    }
+
+    private checkSenderReturn(senderId:string){
+        const r = this.returnedSenders.get(senderId);
+        if(!r) return;
+        const now = Date.now();
+        const sender:any = this.nmosState.senders[senderId];
+        if(!sender){ this.returnedSenders.delete(senderId); return; }
+        const raw = this.nmosState.sendersManifestDetail?.[senderId]?._RAWSDP;
+        const sdp = typeof raw === "string" ? raw : "";
+        if(sdp !== r.sdp){ r.sdp = sdp; r.sdpAt = now; }
+        // Either side saying "on" counts, as for the conflict check; a sender
+        // that reports no state at all cannot be waited for.
+        const active = this.senderIsOn(senderId) !== false;
+        if(!active){ r.activeAt = 0; }else if(!r.activeAt){ r.activeAt = now; }
+        const ready = active && /^m=/m.test(sdp) && now - Math.max(r.sdpAt, r.activeAt) >= NmosRegistryConnector.RETURN_SETTLE_MS;
+        if(!ready){
+            r.readyAt = 0;
+            if(now - r.backAt >= NmosRegistryConnector.RETURN_GIVE_UP_MS){
+                this.returnedSenders.delete(senderId);
+                const receivers = this.receiversNaming(senderId);
+                if(receivers.length > 0){
+                    SyncLog.log("info", "Crosspoint", "Sender \"" + (sender.label || senderId) + "\" is back, but did not come up " +
+                        (active ? "with an SDP" : "active") + " within " + Math.round(NmosRegistryConnector.RETURN_GIVE_UP_MS / 60000) +
+                        " min. Its receivers are not re-taken: " + receivers.map((id)=>"\"" + this.receiverLabel(id) + "\"").join(", ") + ".",
+                        { senderId, receivers });
+                }
+                return;
+            }
+            this.armSenderReturn(senderId);
+            return;
+        }
+        // Back exactly as it went: its registration lapsed, it did not
+        // restart. The o= line is left out — some devices write a new one
+        // on every fetch; the IS-04 version is the stronger word.
+        const changed = NmosRegistryConnector.sdpChangedFields(r.before, sdp);
+        if(r.beforeVersion && "" + (sender.version || "") === r.beforeVersion && changed !== null && changed.length === 0){
+            this.returnedSenders.delete(senderId);
+            const receivers = this.receiversNaming(senderId);
+            if(receivers.length > 0){
+                this.logLapsed("\"" + (sender.label || senderId) + "\" (" + receivers.length + " receiver" + (receivers.length === 1 ? "" : "s") +
+                    ", gone " + NmosRegistryConnector.duration(r.backAt - r.goneAt) + ")");
+            }
+            return;
+        }
+        if(!r.readyAt){ r.readyAt = now; }
+        // A device with an IS-12 control reports when the sender transmits
+        // and is in sync. Wait for that, but not forever: some devices
+        // monitor their receivers only.
+        let monitorNote = "";
+        if(this.senderHasMonitor(sender)){
+            const st = Bcp008Monitor.instance?.getStatus(senderId);
+            const transmitting = !!st && (st.status === 1 || st.status === 2);
+            if(!transmitting){
+                if(now - r.readyAt < NmosRegistryConnector.RETURN_MONITOR_WAIT_MS){
+                    this.armSenderReturn(senderId);
+                    return;
+                }
+                monitorNote = " Its BCP-008 monitor still reports " + (st ? ["Inactive", "Healthy", "Partially healthy", "Unhealthy"][st.status] || "nothing" : "nothing") +
+                    " after " + Math.round(NmosRegistryConnector.RETURN_MONITOR_WAIT_MS / 1000) + " s.";
+            }
+        }
+        this.returnedSenders.delete(senderId);
+        this.retakeReturnedSender(senderId, r.goneAt, r.backAt, r.before, sdp, monitorNote);
+    }
+
+    private retakeReturnedSender(senderId:string, goneAt:number, backAt:number, before:string, after:string, monitorNote:string){
+        const sender:any = this.nmosState.senders[senderId];
+        const changed = NmosRegistryConnector.sdpChangedFields(before, after);
+        const sdpNote = changed === null ? "No SDP from before to compare."
+            : changed.length === 0 ? "SDP unchanged."
+            : "SDP changed: " + changed.join(", ") + ".";
+        const head = "Sender \"" + (sender?.label || senderId) + "\" is back after " + NmosRegistryConnector.duration(backAt - goneAt) + ". " + sdpNote;
+        const quoted = (ids:string[])=> ids.map((id)=>"\"" + this.receiverLabel(id) + "\"").join(", ");
+        if(this.settings?.retakeReceiversOnSenderReturn === false){
+            const receivers = this.receiversNaming(senderId);
+            if(receivers.length > 0){
+                SyncLog.log("info", "Crosspoint", head + " Not re-taking " + quoted(receivers) + ": switched off in Setup.",
+                    { senderId, receivers, changed, before, after });
+            }
+            return;
+        }
+        // A receiver that is gone right now misses this re-take and keeps
+        // what it had from before the restart; it is taken when it is back
+        // (checkReceiverReturn).
+        NmosRegistryConnector.capped(this.senderRetakenAt, senderId, Date.now());
+        const result = CrosspointAbstraction.instance?.retakeReceiversOfReturnedSender(senderId);
+        // Nothing to re-take, nothing to say: every restart of a sender
+        // nobody listens to would otherwise fill the log.
+        if(!result || (result.started.length === 0 && result.skipped.length === 0)) return;
+        let text = head;
+        if(result.started.length > 0){
+            text += " Re-taking " + result.started.length + " receiver" + (result.started.length === 1 ? "" : "s") + ": " + quoted(result.started) + ".";
+        }
+        if(result.skipped.length > 0){
+            text += " Not re-taken: " + result.skipped.map((s)=>"\"" + this.receiverLabel(s.id) + "\" (" + s.reason + ")").join(", ") + ".";
+        }
+        SyncLog.log("info", "Crosspoint", text + monitorNote, { senderId, started: result.started, skipped: result.skipped, changed, before, after });
+    }
+
+    /** true: the registry or the device's /active says on. false: we know
+     *  its state and neither does. null: no state at all (IS-04 below v1.2
+     *  and no /active read). */
+    public senderIsOn(senderId:string):boolean|null{
+        const sender:any = this.nmosState.senders[senderId];
+        if(!sender) return null;
+        const active:any = this.nmosState.senderActiveData?.[senderId];
+        if(sender.subscription?.active || active?.master_enable === true) return true;
+        if(sender.subscription || (active && typeof active.master_enable === "boolean")) return false;
+        return null;
+    }
+
+    // One line for a burst: a registry that expired every node brings them
+    // all back at once.
+    private lapsedLog: string[] = [];
+    private lapsedLogTimer: any = null;
+    private logLapsed(entry:string){
+        this.lapsedLog.push(entry);
+        if(this.lapsedLogTimer) return;
+        this.lapsedLogTimer = setTimeout(()=>{
+            this.lapsedLogTimer = null;
+            const list = this.lapsedLog;
+            this.lapsedLog = [];
+            SyncLog.log("info", "Crosspoint", list.length + " sender" + (list.length === 1 ? " is" : "s are") +
+                " back exactly as before (same IS-04 version and SDP): the registration lapsed, no restart. Their receivers are not re-taken: " +
+                list.slice(0, 20).join(", ") + (list.length > 20 ? " and " + (list.length - 20) + " more" : "") + ".", { senders: list });
+        }, 2000);
+    }
+
+    /** Receivers whose registry entry names the sender and that are on. */
+    private receiversNaming(senderId:string):string[]{
+        let ids:string[] = [];
+        for(const id of Object.keys(this.nmosState.receivers)){
+            const sub = this.nmosState.receivers[id]?.subscription;
+            if(sub && sub.active && sub.sender_id === senderId){ ids.push(id); }
+        }
+        return ids;
+    }
+
+    private receiverLabel(receiverId:string):string{
+        return "" + (this.nmosState.receivers[receiverId]?.label || receiverId);
+    }
+
+    private senderHasMonitor(sender:any):boolean{
+        if(!Bcp008Monitor.instance || !Bcp008Monitor.instance.isEnabled()) return false;
+        const device:any = this.nmosState.devices[sender?.device_id];
+        return NmosRegistryConnector.controlsOf(device).some((c:any)=>
+            typeof c?.type === "string" && c.type.startsWith("urn:x-nmos:control:ncp/") && typeof c?.href === "string" && c.href.startsWith("ws"));
+    }
+
+    /** What differs between two SDPs, by field: "c=", "m=", "a=mediaclk", …
+     *  The o= line is left out — its version moves on every publish.
+     *  null when there is nothing from before to compare with. */
+    static sdpChangedFields(before:string, after:string):string[]|null{
+        if(!before || !after) return null;
+        const lines = (sdp:string)=> sdp.split(/\r?\n/).map((l)=>l.trim()).filter((l)=>l.length > 0 && !l.startsWith("o="));
+        const count = (list:string[])=>{
+            const m:Map<string, number> = new Map();
+            list.forEach((l)=>m.set(l, (m.get(l) || 0) + 1));
+            return m;
+        };
+        const a = count(lines(before)), b = count(lines(after));
+        const fields:string[] = [];
+        const note = (line:string)=>{
+            const field = line.startsWith("a=") ? line.split(":")[0] : line.slice(0, 2);
+            if(!fields.includes(field)){ fields.push(field); }
+        };
+        a.forEach((n, l)=>{ if((b.get(l) || 0) !== n){ note(l); } });
+        b.forEach((n, l)=>{ if((a.get(l) || 0) !== n){ note(l); } });
+        return fields;
+    }
+
+    static duration(ms:number):string{
+        const s = Math.max(0, Math.round(ms / 1000));
+        if(s < 60) return s + " s";
+        const m = Math.floor(s / 60);
+        if(m < 60) return m + " min " + (s % 60) + " s";
+        return Math.floor(m / 60) + " h " + (m % 60) + " min";
+    }
+
+    // ----- Receivers that come back after their sender restarted -----
+    // A whole rack powered up again: the sender is back first, its
+    // receivers on another device later. The sender's re-take did not reach
+    // them, and they restore what they held from before its restart. So a
+    // receiver that was gone when its sender was last re-taken, and is back
+    // naming that sender, is taken once more too — same rules as the
+    // sender's re-take. A receiver that was there for it needs nothing, one
+    // whose sender is still on its way back is taken with the sender.
+    private senderRetakenAt: Map<string, number> = new Map();
+    private goneReceivers: Map<string, number> = new Map();
+    private returnedReceivers: Map<string, { goneAt:number, backAt:number, timer:any }> = new Map();
+    private receiverReturnLog: string[] = [];
+    private receiverReturnLogTimer: any = null;
+
+    private noteReceiverGone(receiverId:string){
+        // Gone again before it was taken: it still holds what it had then.
+        const pending = this.returnedReceivers.get(receiverId);
+        this.cancelReceiverReturn(receiverId);
+        NmosRegistryConnector.capped(this.goneReceivers, receiverId, pending ? pending.goneAt : Date.now());
+    }
+
+    private receiverArrived(receiverId:string){
+        const goneAt = this.goneReceivers.get(receiverId);
+        if(goneAt === undefined) return;
+        this.goneReceivers.delete(receiverId);
+        this.cancelReceiverReturn(receiverId);
+        this.returnedReceivers.set(receiverId, { goneAt, backAt: Date.now(), timer: null });
+        this.armReceiverReturn(receiverId);
+    }
+
+    private armReceiverReturn(receiverId:string){
+        const r = this.returnedReceivers.get(receiverId);
+        if(!r) return;
+        r.timer = setTimeout(()=>{
+            r.timer = null;
+            try{ this.checkReceiverReturn(receiverId); }catch(e){ this.returnedReceivers.delete(receiverId); }
+        }, NmosRegistryConnector.RETURN_CHECK_MS);
+    }
+
+    private cancelReceiverReturn(receiverId:string){
+        const r = this.returnedReceivers.get(receiverId);
+        if(!r) return;
+        if(r.timer){ clearTimeout(r.timer); }
+        this.returnedReceivers.delete(receiverId);
+    }
+
+    private checkReceiverReturn(receiverId:string){
+        const r = this.returnedReceivers.get(receiverId);
+        if(!r) return;
+        const now = Date.now();
+        const receiver:any = this.nmosState.receivers[receiverId];
+        const sub = receiver?.subscription;
+        const senderId:string = (sub && sub.active && typeof sub.sender_id === "string") ? sub.sender_id : "";
+        // Was it gone when its sender was last re-taken? Re-takes from
+        // before it went do not count: it was there for them.
+        const retakenAt = senderId ? this.senderRetakenAt.get(senderId) : undefined;
+        const missed = retakenAt !== undefined && retakenAt > r.goneAt;
+        // Its sender still on its way back: that re-take includes it.
+        const withSender = !!senderId && this.returnedSenders.has(senderId);
+        const settled = now - r.backAt >= NmosRegistryConnector.RETURN_SETTLE_MS;
+        if(!receiver || withSender){ this.returnedReceivers.delete(receiverId); return; }
+        // The device may name its sender only a moment after registering:
+        // wait for that until the receiver has settled, then decide.
+        if(!missed){
+            if(settled){ this.returnedReceivers.delete(receiverId); }else{ this.armReceiverReturn(receiverId); }
+            return;
+        }
+        if(!settled || this.senderIsOn(senderId) === false){
+            if(now - r.backAt >= NmosRegistryConnector.RETURN_GIVE_UP_MS){ this.returnedReceivers.delete(receiverId); return; }
+            this.armReceiverReturn(receiverId);
+            return;
+        }
+        this.returnedReceivers.delete(receiverId);
+        const senderLabel = "" + (this.nmosState.senders[senderId]?.label || senderId);
+        const name = "\"" + this.receiverLabel(receiverId) + "\" (sender \"" + senderLabel + "\")";
+        if(this.settings?.retakeReceiversOnSenderReturn === false){
+            this.logReceiverReturn(name + " not re-taken: switched off in Setup");
+            return;
+        }
+        const result = CrosspointAbstraction.instance?.retakeReceiversOfReturnedSender(senderId, [receiverId]);
+        if(!result) return;
+        if(result.started.length > 0){ this.logReceiverReturn(name); }
+        result.skipped.forEach((s)=>{ this.logReceiverReturn(name + " not re-taken: " + s.reason); });
+    }
+
+    // One line for a burst: a rack coming back brings many receivers at once.
+    private logReceiverReturn(entry:string){
+        this.receiverReturnLog.push(entry);
+        if(this.receiverReturnLogTimer) return;
+        this.receiverReturnLogTimer = setTimeout(()=>{
+            this.receiverReturnLogTimer = null;
+            const list = this.receiverReturnLog;
+            this.receiverReturnLog = [];
+            SyncLog.log("info", "Crosspoint", "Back after their sender restarted, re-taking with its current SDP: " +
+                list.slice(0, 20).join(", ") + (list.length > 20 ? " and " + (list.length - 20) + " more" : "") + ".", { receivers: list });
+        }, 1000);
     }
 
     updateNewNmosItemTimer:any|null = null;
@@ -1246,7 +1632,7 @@ export class NmosRegistryConnector {
                         // Takes effect after REMOVAL_GRACE_MS, see deferRemoval.
                         try {
                             if(this.nmosState[type][g.path]){
-                                this.deferRemoval(type, g.path);
+                                this.deferRemoval(type, g.path, registryUrl);
                             }
                         } catch (e) {}
                     }
@@ -1297,12 +1683,18 @@ export class NmosRegistryConnector {
                         setTimeout(()=>{
                             this.getSenderActive(type, g);
                         },100);
+                        if(newIds.has(g.path)){
+                            this.senderArrived(g.path);
+                        }
                     }
 
                     if(type == "receivers"){
                         // No `pre`: added to the registry just now, not
                         // part of the snapshot a (re)subscription starts with.
                         this.receiverChanged(g.path, !g.hasOwnProperty("pre"));
+                        if(newIds.has(g.path)){
+                            this.receiverArrived(g.path);
+                        }
                     }
 
                     if(type == "devices" && newIds.has(g.path)){
@@ -2392,17 +2784,17 @@ export class NmosRegistryConnector {
         return info
     }
 
-    async makeConnection(receiverId:string, senderInfo: CrosspointConnectionSenderInfo){
+    async makeConnection(receiverId:string, senderInfo: CrosspointConnectionSenderInfo, opts:{automatic?:boolean} = {}){
         let node = this.takeStarted(receiverId);
         try{
-            return await this.makeConnectionNow(receiverId, senderInfo);
+            return await this.makeConnectionNow(receiverId, senderInfo, opts);
         }finally{
             this.takeEnded(node);
             this.receiverTaken(receiverId);
         }
     }
 
-    private async makeConnectionNow(receiverId:string, senderInfo: CrosspointConnectionSenderInfo){
+    private async makeConnectionNow(receiverId:string, senderInfo: CrosspointConnectionSenderInfo, opts:{automatic?:boolean} = {}){
 
         if(senderInfo.error != ""){
             SyncLog.log("warning", "NMOS Connect", "No valid sender Info: " + senderInfo.error);
@@ -2533,6 +2925,17 @@ export class NmosRegistryConnector {
         // then the two disagree and every take fails with "Invalid
         // parameter".
         let receiverActive = await this.getReceiverActive(receiverId, controlHrefs, device);
+        // An automatic take was decided on the matrix as it was a moment
+        // ago. If the device says the receiver is off or on another sender
+        // by now — an operator's take, the Details toggle, another
+        // controller — that is the newer word. A sender_id of null is no
+        // contradiction: some devices keep receiving without naming it.
+        if(opts.automatic && receiverActive &&
+           (receiverActive.master_enable !== true || (receiverActive.sender_id && receiverActive.sender_id !== senderInfo.senderId))){
+            let now = receiverActive.master_enable !== true ? "is off" : "is on sender " + receiverActive.sender_id;
+            SyncLog.log("info", "NMOS Connect", "Not re-taking receiver " + receiverId + ": it " + now + " by now.");
+            throw new Error("Receiver " + now + " by now — not re-taken.");
+        }
         let receiverLegCount = NmosRegistryConnector.legCountFromActive(receiverActive, receiver);
         if(!receiverActive){
             SyncLog.log("warning", "NMOS Connect", "Could not read the IS-05 active parameters of receiver " + receiverId +
