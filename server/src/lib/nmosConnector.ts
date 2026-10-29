@@ -5,6 +5,7 @@
 
 import * as WebSocket from "ws";
 import * as dns from "dns";
+import * as crypto from "crypto";
 import axios from "axios";
 import { SyncObject } from "./SyncServer/syncObject";
 import { Subject } from "rxjs";
@@ -352,19 +353,29 @@ export class NmosRegistryConnector {
 
     // ----- Receivers that refuse a transport file -----
     // IS-05 lets a controller hand a receiver the sender's SDP so it learns
-    // the media format. Not every device accepts one: a Riedel FusioN answers
-    // 400 "Invalid parameter" to ANY transport_file on its v1.0 endpoint —
-    // its own SDP, read from /active and sent straight back, included.
+    // the media format. Not every receiver takes every SDP. On a Riedel
+    // FusioN the audio receivers answer 400 "Invalid parameter" to the SDP
+    // of their HorizoN sender, while the video and ancillary receivers behind
+    // the same connection API take theirs — and need it. Patched without
+    // one, the video receiver went back to 1080p50 on every take and every
+    // disconnect, whatever had been set on the device, and its /active
+    // showed an old 1080p50 SDP: a 12G take never got a picture.
     //
-    // Keyed by the IS-05 endpoint that refused it, not by the device: one
-    // node can publish a whole row of devices behind a single connection API,
-    // and they all behave the same. Keying by device made every one of them
-    // burn its own failed PATCH before learning the same lesson.
-    private transportFileUnsupported:Set<string> = new Set<string>();
+    // So a refusal counts for that receiver and that SDP, nothing wider. The
+    // same SDP on the same receiver goes without the file from the start the
+    // next time; any other SDP, and any other receiver, gets it again. 4.31
+    // keyed it by the connection API: after the first audio receiver of the
+    // FusioN refused, its video receiver got no SDP until the next restart.
+    //
+    // "<receiver id> <hash of the SDP>", see refusalKey().
+    private transportFileRefused:Set<string> = new Set<string>();
 
-    /** True when any of these control endpoints has already refused one. */
-    private refusesTransportFile(controlHrefs:{href:string}[]):boolean{
-        return controlHrefs.some((c) => this.transportFileUnsupported.has(c.href));
+    /** The memory key for a receiver and the SDP it was offered. Line breaks
+     *  and the o= line are left out: some devices write a new o= line on
+     *  every fetch, and the stream is still the same. */
+    private static refusalKey(receiverId:string, sdp:string):string{
+        let lines = ("" + sdp).split(/\r?\n/).map((l)=>l.trim()).filter((l)=>l.length > 0 && !l.startsWith("o="));
+        return receiverId + " " + crypto.createHash("sha1").update(lines.join("\n")).digest("hex");
     }
     private nmosRegistryList: NmosRegistry[] = [];
 
@@ -2992,7 +3003,7 @@ export class NmosRegistryConnector {
 
             // An empty manifest is not a transport file, it is a PATCH the
             // device has every right to reject.
-            if(manifest && !this.refusesTransportFile(controlHrefs)){
+            if(manifest && !this.transportFileRefused.has(NmosRegistryConnector.refusalKey(receiverId, manifest))){
                 patch.transport_file = {
                     type: "application/sdp",
                     data: manifest,
@@ -3022,9 +3033,10 @@ export class NmosRegistryConnector {
             //}
         //}
 
-        // A receiver given no transport file runs the format set on the
-        // device itself, whatever the sender sends. Say so when they differ:
-        // the picture just stays black and nothing else reports it.
+        // A receiver given no transport file runs a format of its own —
+        // the one set on the device, or the last SDP it took — whatever the
+        // sender sends. Say so when they differ: the picture just stays
+        // black and nothing else reports it.
         let patched = (sent:any, result:any, patchHref:string, controlHref:string) => {
             if(!sent.transport_file && senderInfo.senderId != "disconnect" && senderInfo.manifestFile){
                 this.checkReceiverFormat(receiverId, controlHref, device, senderInfo.manifestFile, senderInfo.senderId);
@@ -3153,7 +3165,7 @@ export class NmosRegistryConnector {
                         }
                         e = r.error;
                     }
-                    // A receiver that will not take a transport file at all
+                    // A receiver that will not take this transport file
                     // rejects the whole PATCH over it. Everything the join
                     // needs — multicast address, port, SSM source, per leg —
                     // already rides in transport_params, so try again
@@ -3164,11 +3176,11 @@ export class NmosRegistryConnector {
                         let retry:any = { ...patch };
                         delete retry.transport_file;
                         let refused = () => {
-                            this.transportFileUnsupported.add(href.href);
+                            this.transportFileRefused.add(NmosRegistryConnector.refusalKey(receiverId, patch.transport_file.data));
                             SyncLog.log("warning", "nmos_connect", "Receiver " + receiverId + " refuses a transport file on its IS-05 " +
                                 href.version + " endpoint — patched without it. The stream parameters are carried by transport_params; " +
-                                "the device has to know the media format by itself. Every receiver behind " + href.href +
-                                " now leaves the file out from the start.", {href:patchHref, status:e.response?.status, error:e.response?.data});
+                                "the device has to know the media format by itself. This receiver gets this SDP without the file from now on; " +
+                                "other receivers and other SDPs still get it.", {href:patchHref, status:e.response?.status, error:e.response?.data});
                         };
                         try{
                             let result = await put(retry);
